@@ -81,8 +81,8 @@ defmodule Tailscale do
     tailscale_dir = Keyword.get(opts, :tailscale_dir, @default_tailscale_dir)
     timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-    with :ok <- validate_executable(daemon_path, "daemon"),
-         :ok <- validate_executable(cli_path, "CLI"),
+    with :ok <- validate_executable(daemon_path),
+         :ok <- validate_executable(cli_path),
          :ok <- ensure_directory(Path.dirname(socket_path)),
          :ok <- ensure_directory(tailscale_dir) do
       GenServer.start_link(__MODULE__, {daemon_path, cli_path, socket_path, tailscale_dir, timeout},
@@ -245,16 +245,16 @@ defmodule Tailscale do
     end
   end
 
-  defp validate_executable(path, name) do
+  defp validate_executable(path) do
     cond do
       not File.exists?(path) ->
-        {:error, {:validation_failed, "Tailscale #{name} not found at #{path}"}}
+        {:error, "File #{path} not found at"}
 
       not File.regular?(path) ->
-        {:error, {:validation_failed, "Tailscale #{name} at #{path} is not a regular file"}}
+        {:error, "File at #{path} is not a regular file"}
 
       not executable?(path) ->
-        {:error, {:validation_failed, "Tailscale #{name} at #{path} is not executable"}}
+        {:error, "File at #{path} is not executable"}
 
       true ->
         :ok

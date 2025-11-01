@@ -45,13 +45,13 @@ defmodule TailscaleTest do
 
     test "returns validation error when daemon binary does not exist", %{opts: opts} do
       opts = Keyword.put(opts, :daemon_path, "/nonexistent/tailscaled")
-      assert {:error, {:validation_failed, message}} = Tailscale.start_link(opts)
+      assert {:error, message} = Tailscale.start_link(opts)
       assert message =~ "not found"
     end
 
     test "returns validation error when cli binary does not exist", %{opts: opts} do
       opts = Keyword.put(opts, :cli_path, "/nonexistent/tailscale")
-      assert {:error, {:validation_failed, message}} = Tailscale.start_link(opts)
+      assert {:error, message} = Tailscale.start_link(opts)
       assert message =~ "not found"
     end
 
@@ -61,7 +61,7 @@ defmodule TailscaleTest do
       File.chmod!(non_executable, 0o644)
 
       opts = Keyword.put(opts, :daemon_path, non_executable)
-      assert {:error, {:validation_failed, message}} = Tailscale.start_link(opts)
+      assert {:error, message} = Tailscale.start_link(opts)
       assert message =~ "not executable"
     end
   end
