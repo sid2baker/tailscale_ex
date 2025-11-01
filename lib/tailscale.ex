@@ -222,7 +222,7 @@ defmodule Tailscale do
 
   defp exec_command(state, command, args \\ []) when is_list(args) do
     # Add --socket flag to all commands
-    args_with_socket = ["--socket=#{state.socket_path}", command] ++ args
+    args_with_socket = [command | args] ++ ["--socket=#{state.socket_path}"]
     muontrap_opts = [
       stderr_to_stdout: true,
       timeout: state.timeout
