@@ -3,7 +3,8 @@ defmodule Tailscale do
   A supervised GenServer wrapper for Tailscale daemon and CLI.
 
   This module manages the lifecycle of the `tailscaled` daemon using MuonTrap
-  and provides convenience functions for checking Tailscale status.
+  and provides convenience functions for checking Tailscale status and executing
+  CLI commands.
 
   ## Usage
 
@@ -17,37 +18,42 @@ defmodule Tailscale do
       # Check if Tailscale is online
       Tailscale.online?()
 
-  For CLI commands, see `Tailscale.CLI`.
+      # Execute CLI commands
+      Tailscale.cli("status", ["--json"])
+      Tailscale.cli("up", ["--hostname=mynode"])
   """
 
   use GenServer
   require Logger
 
-  @default_daemon_path "/usr/sbin/tailscaled"
+  @default_daemon_path "/usr/bin/tailscaled"
   @default_cli_path "/usr/bin/tailscale"
-  @default_tailscale_dir "/tmp/tailscale"
-  @default_socket_path "/tmp/tailscale/tailscaled.sock"
+  @default_tailscale_dir "/data/tailscale"
+  @default_socket_path "/run/tailscale/tailscaled.sock"
+  @default_timeout 30_000
 
   @type option ::
           {:daemon_path, Path.t()}
           | {:cli_path, Path.t()}
           | {:tailscale_dir, Path.t()}
           | {:socket_path, Path.t()}
+          | {:timeout, non_neg_integer()}
           | {:name, atom()}
 
   @type options :: [option()]
 
   defmodule State do
     @moduledoc false
-    defstruct [:daemon_pid, :daemon_path, :cli_path, :tailscale_dir, :socket_path, :version]
+    defstruct [:daemon_pid, :daemon_path, :cli_path, :socket_path, :tailscale_dir, :version, :timeout]
 
     @type t :: %__MODULE__{
             daemon_pid: pid() | nil,
             daemon_path: Path.t(),
             cli_path: Path.t(),
-            tailscale_dir: Path.t(),
             socket_path: Path.t(),
-            version: String.t() | nil
+            tailscale_dir: Path.t(),
+            version: String.t() | nil,
+            timeout: non_neg_integer()
           }
   end
 
@@ -58,31 +64,31 @@ defmodule Tailscale do
 
   ## Options
 
+    * `:name` - Name for the GenServer (default: `#{__MODULE__}`)
     * `:daemon_path` - Path to the `tailscaled` binary (default: `#{@default_daemon_path}`)
     * `:cli_path` - Path to the `tailscale` CLI binary (default: `#{@default_cli_path}`)
-    * `:tailscale_dir` - Directory for Tailscale state (default: `#{@default_tailscale_dir}`)
     * `:socket_path` - Path to the Unix socket (default: `#{@default_socket_path}`)
-    * `:name` - Name for the GenServer (default: `#{__MODULE__}`)
+    * `:tailscale_dir` - Directory for Tailscale state (default: `#{@default_tailscale_dir}`)
+    * `:timeout` - Command timeout in milliseconds (default: `#{@default_timeout}`)
 
   """
   @spec start_link(options()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
-  end
+    daemon_path = Keyword.get(opts, :daemon_path, @default_daemon_path)
+    cli_path = Keyword.get(opts, :cli_path, @default_cli_path)
+    socket_path = Keyword.get(opts, :socket_path, @default_socket_path)
+    tailscale_dir = Keyword.get(opts, :tailscale_dir, @default_tailscale_dir)
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-  @doc """
-  Returns a child specification for use in a supervision tree.
-  """
-  @spec child_spec(options()) :: Supervisor.child_spec()
-  def child_spec(opts) do
-    %{
-      id: __MODULE__,
-      start: {__MODULE__, :start_link, [opts]},
-      type: :worker,
-      restart: :permanent,
-      shutdown: 5000
-    }
+    with :ok <- validate_executable(daemon_path, "daemon"),
+         :ok <- validate_executable(cli_path, "CLI"),
+         :ok <- ensure_directory(Path.dirname(socket_path)),
+         :ok <- ensure_directory(tailscale_dir) do
+      GenServer.start_link(__MODULE__, {daemon_path, cli_path, socket_path, tailscale_dir, timeout},
+        name: name
+      )
+    end
   end
 
   @doc """
@@ -92,13 +98,7 @@ defmodule Tailscale do
   """
   @spec online?(GenServer.server()) :: boolean()
   def online?(server \\ __MODULE__) do
-    case Tailscale.CLI.status(server, json: true) do
-      {:ok, status} when is_map(status) ->
-        Map.get(status, "Self", %{}) |> Map.get("Online", false)
-
-      _ ->
-        false
-    end
+    GenServer.call(server, :online?)
   end
 
   @doc """
@@ -117,29 +117,32 @@ defmodule Tailscale do
     GenServer.call(server, :version)
   end
 
+  @doc """
+  Executes a Tailscale CLI command with the given arguments.
+
+  ## Examples
+
+      Tailscale.cli("status", ["--json"])
+      Tailscale.cli("up", ["--hostname=mynode"])
+
+  """
+  @spec cli(GenServer.server(), String.t(), [String.t()]) :: {:ok, String.t() | map()} | {:error, term()}
+  def cli(server \\ __MODULE__, command, args) do
+    GenServer.call(server, {:cli, command, args}, :infinity)
+  end
+
   # Server callbacks
 
   @impl true
-  def init(opts) do
-    daemon_path = Keyword.get(opts, :daemon_path, @default_daemon_path)
-    cli_path = Keyword.get(opts, :cli_path, @default_cli_path)
-    socket_path = Keyword.get(opts, :socket_path, @default_socket_path)
-    tailscale_dir = Keyword.get(opts, :tailscale_dir, @default_tailscale_dir)
-
-    # Ensure directories exist
-    File.mkdir_p!(tailscale_dir)
-
-    # Ensure socket directory exists
-    socket_dir = Path.dirname(socket_path)
-    File.mkdir_p!(socket_dir)
-
+  def init({daemon_path, cli_path, socket_path, tailscale_dir, timeout}) do
     state = %State{
       daemon_path: daemon_path,
       cli_path: cli_path,
       tailscale_dir: tailscale_dir,
       socket_path: socket_path,
       daemon_pid: nil,
-      version: nil
+      version: nil,
+      timeout: timeout
     }
 
     {:ok, state, {:continue, :startup}}
@@ -148,7 +151,13 @@ defmodule Tailscale do
   @impl true
   def handle_continue(:startup, state) do
     # Check version first
-    version = check_version(state)
+    version =
+      case exec_command(state, "--version") do
+        {:ok, %{"majorMinorPatch" => v}} -> v
+        {:ok, output} -> output
+        _ -> "unknown"
+      end
+
     Logger.info("Tailscale version: #{version}")
 
     # Start daemon
@@ -164,28 +173,41 @@ defmodule Tailscale do
   end
 
   @impl true
-  def handle_call(:daemon_pid, _from, %State{daemon_pid: nil} = state) do
-    {:reply, {:error, :not_started}, state}
-  end
-
-  def handle_call(:daemon_pid, _from, %State{daemon_pid: pid} = state) do
-    {:reply, {:ok, pid}, state}
-  end
-
-  def handle_call(:version, _from, %State{version: nil} = state) do
-    {:reply, {:error, :not_available}, state}
-  end
-
-  def handle_call(:version, _from, %State{version: version} = state) do
-    {:reply, {:ok, version}, state}
-  end
-
   def handle_call({:cli_path}, _from, state) do
     {:reply, state.cli_path, state}
   end
 
   def handle_call({:socket_path}, _from, state) do
     {:reply, state.socket_path, state}
+  end
+
+  def handle_call(:version, _from, state) do
+    case exec_command(state, "--version", ["--json"]) do
+      {:ok, version} -> IO.inspect(version)
+    end
+    {:reply, {:ok, "test"}, state}
+  end
+
+  def handle_call(_msg, _from, %State{daemon_pid: nil} = state) do
+    {:reply, {:error, :not_started}, state}
+  end
+
+  def handle_call(:online?, _from, state) do
+    case exec_command(state, "status", ["--json"]) do
+      {:ok, %{"Self" => %{"Online" => online?}}} -> {:reply, online?, state}
+      {:error, reason} ->
+        Logger.warning("Failed to check Tailscale status: #{inspect(reason)}")
+        {:reply, false, state}
+    end
+  end
+
+  def handle_call(:daemon_pid, _from, %State{daemon_pid: pid} = state) do
+    {:reply, {:ok, pid}, state}
+  end
+
+  def handle_call({:cli, command, args}, _from, state) do
+    result = exec_command(state, command, args)
+    {:reply, result, state}
   end
 
   @impl true
@@ -210,17 +232,62 @@ defmodule Tailscale do
     )
   end
 
-  defp check_version(state) do
-    case System.cmd(state.cli_path, ["--version"], stderr_to_stdout: true) do
-      {output, 0} ->
-        # Parse first line to get version number
-        output
-        |> String.split("\n", trim: true)
-        |> List.first()
-        |> String.trim()
+  defp exec_command(state, command, args \\ []) when is_list(args) do
+    # Add --socket flag to all commands
+    args_with_socket = ["--socket=#{state.socket_path}", command] ++ args
+    muontrap_opts = [
+      stderr_to_stdout: true,
+      timeout: state.timeout
+    ]
 
-      {_output, _exit_code} ->
-        "unknown"
+    case MuonTrap.cmd(state.cli_path, args_with_socket, muontrap_opts) do
+      {output, 0} ->
+        trimmed = String.trim(output)
+        # Try to decode as JSON, fall back to string
+        case JSON.decode(trimmed) do
+          {:ok, decoded} -> {:ok, decoded}
+          _ -> {:ok, trimmed}
+        end
+
+      {output, :timeout} ->
+        {:error, {:timeout, String.trim(output)}}
+
+      {output, exit_code} ->
+        {:error, {exit_code, String.trim(output)}}
+    end
+  end
+
+  defp validate_executable(path, name) do
+    cond do
+      not File.exists?(path) ->
+        {:error, {:validation_failed, "Tailscale #{name} not found at #{path}"}}
+
+      not File.regular?(path) ->
+        {:error, {:validation_failed, "Tailscale #{name} at #{path} is not a regular file"}}
+
+      not executable?(path) ->
+        {:error, {:validation_failed, "Tailscale #{name} at #{path} is not executable"}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp executable?(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{mode: mode}} ->
+        # Check if any execute bit is set (owner, group, or other)
+        Bitwise.band(mode, 0o111) != 0
+
+      {:error, _} ->
+        false
+    end
+  end
+
+  defp ensure_directory(path) do
+    case File.mkdir_p(path) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:validation_failed, "Failed to create directory #{path}: #{inspect(reason)}"}}
     end
   end
 end
