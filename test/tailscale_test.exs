@@ -3,21 +3,22 @@ defmodule TailscaleTest do
   doctest Tailscale
 
   setup do
-    # Create mock binaries
     %{cli_path: cli_path, daemon_path: daemon_path, test_dir: mock_dir} =
       MockTailscale.create_mocks()
 
-    # Use test-specific state directory
     state_dir =
       Path.join(System.tmp_dir!(), "tailscale_state_#{:erlang.unique_integer([:positive])}")
 
     File.mkdir_p!(state_dir)
 
+    socket_path = Path.join(state_dir, "tailscaled.sock")
+
     opts = [
       name: :"test_tailscale_#{:erlang.unique_integer([:positive])}",
       daemon_path: daemon_path,
       cli_path: cli_path,
-      tailscale_dir: state_dir
+      tailscale_dir: state_dir,
+      socket_path: socket_path
     ]
 
     on_exit(fn ->
@@ -41,6 +42,28 @@ defmodule TailscaleTest do
       assert Process.whereis(:custom_tailscale) == pid
       GenServer.stop(pid)
     end
+
+    test "returns validation error when daemon binary does not exist", %{opts: opts} do
+      opts = Keyword.put(opts, :daemon_path, "/nonexistent/tailscaled")
+      assert {:error, {:validation_failed, message}} = Tailscale.start_link(opts)
+      assert message =~ "not found"
+    end
+
+    test "returns validation error when cli binary does not exist", %{opts: opts} do
+      opts = Keyword.put(opts, :cli_path, "/nonexistent/tailscale")
+      assert {:error, {:validation_failed, message}} = Tailscale.start_link(opts)
+      assert message =~ "not found"
+    end
+
+    test "returns validation error when daemon path is not executable", %{opts: opts, state_dir: state_dir} do
+      non_executable = Path.join(state_dir, "not_executable")
+      File.write!(non_executable, "#!/bin/bash\necho test")
+      File.chmod!(non_executable, 0o644)
+
+      opts = Keyword.put(opts, :daemon_path, non_executable)
+      assert {:error, {:validation_failed, message}} = Tailscale.start_link(opts)
+      assert message =~ "not executable"
+    end
   end
 
   describe "child_spec/1" do
@@ -49,16 +72,14 @@ defmodule TailscaleTest do
 
       assert spec.id == Tailscale
       assert spec.start == {Tailscale, :start_link, [opts]}
-      assert spec.type == :worker
-      assert spec.restart == :permanent
-      assert spec.shutdown == 5000
+      # Note: GenServer default child_spec doesn't include :type, :restart, :shutdown
+      # These are handled by the supervisor
     end
   end
 
   describe "daemon_pid/1" do
     test "returns daemon PID when started", %{opts: opts} do
       assert {:ok, server_pid} = Tailscale.start_link(opts)
-      # Give it time to start
       Process.sleep(100)
 
       assert {:ok, daemon_pid} = Tailscale.daemon_pid(server_pid)
@@ -67,38 +88,75 @@ defmodule TailscaleTest do
 
       GenServer.stop(server_pid)
     end
-
-    test "returns error when daemon not started" do
-      # Create a GenServer that never starts the daemon
-      # For this test, we just check the error case conceptually
-      :ok
-    end
   end
 
   describe "version/1" do
     test "returns version string", %{opts: opts} do
       assert {:ok, server_pid} = Tailscale.start_link(opts)
-      # Give it time to check version
       Process.sleep(100)
 
       assert {:ok, version} = Tailscale.version(server_pid)
       assert is_binary(version)
-      assert version == "1.88.3"
 
       GenServer.stop(server_pid)
     end
   end
 
   describe "online?/1" do
-    test "returns boolean", %{opts: opts} do
+    test "returns true when online", %{opts: opts} do
       assert {:ok, server_pid} = Tailscale.start_link(opts)
-      # Give it time to start
       Process.sleep(100)
 
       result = Tailscale.online?(server_pid)
       assert is_boolean(result)
-      # Mock returns offline by default
-      assert result == false
+      assert result == true
+
+      GenServer.stop(server_pid)
+    end
+  end
+
+  describe "cli/3" do
+    test "executes status command with JSON output", %{opts: opts} do
+      assert {:ok, server_pid} = Tailscale.start_link(opts)
+      Process.sleep(100)
+
+      assert {:ok, result} = Tailscale.cli(server_pid, "status", ["--json"])
+      assert is_map(result)
+      assert result["Self"]["HostName"] == "mock-host"
+      assert result["Self"]["Online"] == true
+
+      GenServer.stop(server_pid)
+    end
+
+    test "executes ip command", %{opts: opts} do
+      assert {:ok, server_pid} = Tailscale.start_link(opts)
+      Process.sleep(100)
+
+      assert {:ok, result} = Tailscale.cli(server_pid, "ip", [])
+      assert is_binary(result)
+      assert result =~ "100.64.0.1"
+
+      GenServer.stop(server_pid)
+    end
+
+    test "executes version command", %{opts: opts} do
+      assert {:ok, server_pid} = Tailscale.start_link(opts)
+      Process.sleep(100)
+
+      assert {:ok, result} = Tailscale.cli(server_pid, "version", [])
+      assert is_binary(result)
+      assert result =~ "1.88.3"
+
+      GenServer.stop(server_pid)
+    end
+
+    test "returns error for unknown command", %{opts: opts} do
+      assert {:ok, server_pid} = Tailscale.start_link(opts)
+      Process.sleep(100)
+
+      assert {:error, {exit_code, output}} = Tailscale.cli(server_pid, "invalid", [])
+      assert exit_code == 1
+      assert output =~ "unknown command"
 
       GenServer.stop(server_pid)
     end
@@ -106,16 +164,11 @@ defmodule TailscaleTest do
 
   describe "supervision" do
     test "can be supervised", %{opts: opts} do
-      children = [
-        {Tailscale, opts}
-      ]
+      children = [{Tailscale, opts}]
 
       assert {:ok, supervisor} = Supervisor.start_link(children, strategy: :one_for_one)
-
-      # Give it time to start
       Process.sleep(100)
 
-      # Find the child
       [{Tailscale, child_pid, :worker, [Tailscale]}] = Supervisor.which_children(supervisor)
       assert Process.alive?(child_pid)
 

@@ -84,12 +84,12 @@ defmodule MockTailscale do
 
       status)
         if [[ "$*" == *"--json"* ]]; then
-          echo '{"Self":{"Online":false,"HostName":"mock-host","TailscaleIPs":["100.64.0.1"]},"Peer":{}}'
+          echo '{"Self":{"Online":true,"HostName":"mock-host","TailscaleIPs":["100.64.0.1"]},"Peer":{}}'
         else
           echo "# Health check:"
-          echo "#     - not logged in"
+          echo "#     - logged in, available"
           echo ""
-          echo "# To log in, run: tailscale up"
+          echo "mock-host  100.64.0.1"
         fi
         exit 0
         ;;
