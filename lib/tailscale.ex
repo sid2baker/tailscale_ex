@@ -26,11 +26,11 @@ defmodule Tailscale do
   use GenServer
   require Logger
 
-  @default_daemon_path "/usr/bin/tailscaled"
+  @default_daemon_path "/usr/sbin/tailscaled"
   @default_cli_path "/usr/bin/tailscale"
   @default_tailscale_dir "/data/tailscale"
   @default_socket_path "/run/tailscale/tailscaled.sock"
-  @default_timeout 30_000
+  @default_timeout 5_000
 
   @type option ::
           {:daemon_path, Path.t()}
