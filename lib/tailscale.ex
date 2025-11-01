@@ -152,7 +152,7 @@ defmodule Tailscale do
   def handle_continue(:startup, state) do
     # Check version first
     version =
-      case exec_command(state, "--version") do
+      case exec_command(state, "version", ["--json"]) do
         {:ok, %{"majorMinorPatch" => v}} -> v
         {:ok, output} -> output
         _ -> "unknown"
@@ -182,10 +182,7 @@ defmodule Tailscale do
   end
 
   def handle_call(:version, _from, state) do
-    case exec_command(state, "--version", ["--json"]) do
-      {:ok, version} -> IO.inspect(version)
-    end
-    {:reply, {:ok, "test"}, state}
+    {:reply, {:ok, state.version}, state}
   end
 
   def handle_call(_msg, _from, %State{daemon_pid: nil} = state) do
