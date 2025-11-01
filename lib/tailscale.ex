@@ -216,7 +216,8 @@ defmodule Tailscale do
         "--tun=userspace-networking",
         "--statedir=#{state.tailscale_dir}",
         "--socket=#{state.socket_path}"
-      ]
+      ],
+      log_output: :info
     )
   end
 
