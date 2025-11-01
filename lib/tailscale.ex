@@ -207,15 +207,6 @@ defmodule Tailscale do
     {:reply, result, state}
   end
 
-  @impl true
-  def terminate(_reason, %State{daemon_pid: nil}), do: :ok
-
-  def terminate(_reason, %State{daemon_pid: pid}) when is_pid(pid) do
-    Logger.info("Stopping Tailscale daemon")
-    GenServer.stop(pid)
-    :ok
-  end
-
   # Private functions
 
   defp start_daemon(state) do
