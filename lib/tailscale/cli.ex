@@ -206,19 +206,57 @@ defmodule Tailscale.CLI do
   @doc """
   Show Tailscale IP addresses for the current device.
 
-  Returns a list of IP addresses (both IPv4 and IPv6).
+  Returns a list of IP addresses (both IPv4 and IPv6) by default, or a single
+  IP address string when using the `:one` option.
+
+  ## Arguments
+
+    * `server` - The Tailscale GenServer
+    * `mode` - Address filter mode (defaults to `:all`):
+      * `:all` - Return all IP addresses (both IPv4 and IPv6)
+      * `:one` - Return only one IP address
+      * `:ipv4` - Return only IPv4 address
+      * `:ipv6` - Return only IPv6 address
 
   ## Examples
 
+      # Get all IPs for current device
       {:ok, ips} = Tailscale.CLI.ip(Tailscale)
+
+      # Get only IPv4 address
+      {:ok, ipv4} = Tailscale.CLI.ip(Tailscale, :ipv4)
+
+      # Get one IP address
+      {:ok, single_ip} = Tailscale.CLI.ip(Tailscale, :one)
+
+      # Get only IPv6 address
+      {:ok, ipv6} = Tailscale.CLI.ip(Tailscale, :ipv6)
 
   """
   @spec ip(server()) :: cli_result()
   def ip(server) do
-    case exec_command(server, ["ip"]) do
+    ip(server, :all)
+  end
+
+  @spec ip(server(), atom()) :: cli_result()
+  def ip(server, mode) when mode in [:all, :one, :ipv4, :ipv6] do
+    args =
+      case mode do
+        :one -> ["ip", "--1"]
+        :ipv4 -> ["ip", "--4"]
+        :ipv6 -> ["ip", "--6"]
+        :all -> ["ip"]
+      end
+
+    case exec_command(server, args) do
       {:ok, output} ->
-        ips = output |> String.split("\n", trim: true)
-        {:ok, ips}
+        result =
+          case mode do
+            :all -> String.split(output, "\n", trim: true)
+            _ -> String.trim(output)
+          end
+
+        {:ok, result}
 
       error ->
         error
