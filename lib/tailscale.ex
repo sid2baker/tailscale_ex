@@ -118,6 +118,22 @@ defmodule Tailscale do
   end
 
   @doc """
+  Logs in to Tailscale using the provided authentication key.
+  """
+  @spec login(GenServer.server(), String.t()) :: :ok | {:error, term()}
+  def login(server \\ __MODULE__, auth_key) do
+    GenServer.call(server, {:login, auth_key})
+  end
+
+  @doc """
+  Returns the current status of the Tailscale daemon.
+  """
+  @spec status(GenServer.server()) :: {:ok, map()} | {:error, term()}
+  def status(server \\ __MODULE__) do
+    GenServer.call(server, :status)
+  end
+
+  @doc """
   Executes a Tailscale CLI command with the given arguments.
 
   ## Examples
@@ -183,6 +199,18 @@ defmodule Tailscale do
 
   def handle_call(:version, _from, state) do
     {:reply, {:ok, state.version}, state}
+  end
+
+  def handle_call({:login, auth_key}, _from, state) do
+    result = exec_command(state, "login", ["--auth_key", auth_key])
+    {:reply, result, state}
+  end
+
+  def handle_call(:status, _from, state) do
+    case exec_command(state, "status", ["--json"]) do
+      {:ok, json} -> {:reply, {:ok, json}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(_msg, _from, %State{daemon_pid: nil} = state) do
