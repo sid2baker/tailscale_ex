@@ -44,7 +44,15 @@ defmodule Tailscale do
 
   defmodule State do
     @moduledoc false
-    defstruct [:daemon_pid, :daemon_path, :cli_path, :socket_path, :tailscale_dir, :version, :timeout]
+    defstruct [
+      :daemon_pid,
+      :daemon_path,
+      :cli_path,
+      :socket_path,
+      :tailscale_dir,
+      :version,
+      :timeout
+    ]
 
     @type t :: %__MODULE__{
             daemon_pid: pid() | nil,
@@ -85,9 +93,9 @@ defmodule Tailscale do
          :ok <- validate_executable(cli_path),
          :ok <- ensure_directory(Path.dirname(socket_path)),
          :ok <- ensure_directory(tailscale_dir) do
-      GenServer.start_link(__MODULE__, {daemon_path, cli_path, socket_path, tailscale_dir, timeout},
-        name: name
-      )
+      GenServer.start_link(
+        __MODULE__,
+        {daemon_path, cli_path, socket_path, tailscale_dir, timeout}, name: name)
     end
   end
 
@@ -142,7 +150,8 @@ defmodule Tailscale do
       Tailscale.cli("up", ["--hostname=mynode"])
 
   """
-  @spec cli(GenServer.server(), String.t(), [String.t()]) :: {:ok, String.t() | map()} | {:error, term()}
+  @spec cli(GenServer.server(), String.t(), [String.t()]) ::
+          {:ok, String.t() | map()} | {:error, term()}
   def cli(server \\ __MODULE__, command, args) do
     GenServer.call(server, {:cli, command, args}, :infinity)
   end
@@ -219,7 +228,9 @@ defmodule Tailscale do
 
   def handle_call(:online?, _from, state) do
     case exec_command(state, "status", ["--json"]) do
-      {:ok, %{"Self" => %{"Online" => online?}}} -> {:reply, online?, state}
+      {:ok, %{"Self" => %{"Online" => online?}}} ->
+        {:reply, online?, state}
+
       {:error, reason} ->
         Logger.warning("Failed to check Tailscale status: #{inspect(reason)}")
         {:reply, false, state}
@@ -233,6 +244,15 @@ defmodule Tailscale do
   def handle_call({:cli, command, args}, _from, state) do
     result = exec_command(state, command, args)
     {:reply, result, state}
+  end
+
+  @impl true
+  def terminate(reason, state) do
+    Logger.warning(
+      "Tailscale GenServer terminating. Reason: #{inspect(reason)}"
+    )
+
+    :ok
   end
 
   # Private functions
@@ -305,8 +325,11 @@ defmodule Tailscale do
 
   defp ensure_directory(path) do
     case File.mkdir_p(path) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:validation_failed, "Failed to create directory #{path}: #{inspect(reason)}"}}
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:validation_failed, "Failed to create directory #{path}: #{inspect(reason)}"}}
     end
   end
 end
