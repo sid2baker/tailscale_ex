@@ -95,7 +95,9 @@ defmodule Tailscale do
          :ok <- ensure_directory(tailscale_dir) do
       GenServer.start_link(
         __MODULE__,
-        {daemon_path, cli_path, socket_path, tailscale_dir, timeout}, name: name)
+        {daemon_path, cli_path, socket_path, tailscale_dir, timeout},
+        name: name
+      )
     end
   end
 
@@ -211,7 +213,7 @@ defmodule Tailscale do
   end
 
   def handle_call({:login, auth_key}, _from, state) do
-    result = exec_command(state, "login", ["--auth_key", auth_key])
+    result = exec_command(state, "login", ["--auth-key", auth_key])
     {:reply, result, state}
   end
 
@@ -248,9 +250,7 @@ defmodule Tailscale do
 
   @impl true
   def terminate(reason, state) do
-    Logger.warning(
-      "Tailscale GenServer terminating. Reason: #{inspect(reason)}"
-    )
+    Logger.warning("Tailscale GenServer terminating. Reason: #{inspect(reason)}")
 
     :ok
   end
