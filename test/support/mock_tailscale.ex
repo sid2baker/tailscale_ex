@@ -71,6 +71,7 @@ defmodule MockTailscale do
       fi
     done
     set -- "${args[@]}"
+    printf '%s\n' "$@" > "$(dirname "$0")/cli-args"
 
     case "$1" in
       --version)

@@ -8,6 +8,7 @@ An Elixir wrapper for [Tailscale](https://tailscale.com), providing a supervised
 - 🔌 **Custom socket paths** - Works in embedded/Nerves environments
 - ⏱️ **Configurable timeouts** - Prevent hanging commands
 - 📦 **Linux binary installer** - Detects the runtime ABI and installs verified, pinned binaries
+- 🌐 **Subnet router API** - Enables Linux forwarding and advertises validated routes
 
 ## Installation
 
@@ -106,6 +107,42 @@ persistent and writable. For reproducible Nerves production firmware, bundling
 pinned binaries at build time remains preferable to downloading them during
 boot.
 
+## Linux subnet routing
+
+Linux must enable kernel forwarding before Tailscale can route advertised
+subnets. The top-level API can inspect and enable it for the current boot:
+
+```elixir
+{:ok, %{ipv4: false, ipv6: false}} = Tailscale.forwarding_status()
+:ok = Tailscale.enable_forwarding()
+```
+
+On a conventional writable Linux system, persist the settings in an idempotent
+`/etc/sysctl.d/99-tailscale.conf` as well:
+
+```elixir
+:ok = Tailscale.enable_forwarding(persist: :sysctl_d)
+```
+
+The calling OS process must have permission to write `/proc` and, when
+requested, `/etc/sysctl.d`. The library never invokes `sudo`.
+
+Advertise IPv4 or IPv6 CIDRs after the node is authenticated:
+
+```elixir
+:ok =
+  Tailscale.advertise_routes([
+    "192.168.1.0/24",
+    "10.0.0.0/24"
+  ])
+```
+
+`advertise_routes/1` validates and deduplicates the CIDRs, verifies forwarding
+for the address families involved, and replaces the complete advertised route
+set. Withdraw all routes with `Tailscale.withdraw_routes/0`. Routes must still
+be approved in the Tailscale admin console or by suitable `autoApprovers`
+policy.
+
 ## Nerves Integration
 
 For embedded/Nerves projects:
@@ -122,20 +159,18 @@ For embedded/Nerves projects:
 
 Kernel TUN mode is the default. It follows the upstream `tailscaled` default interface (`tailscale0`) by omitting the `--tun` flag. This is the recommended mode for a Nerves subnet router because it supports all IP protocols and uses the Linux routing stack.
 
-The Nerves system must include kernel TUN support (`CONFIG_TUN`) and expose `/dev/net/tun`. Subnet routing also requires kernel forwarding. Configure it during boot, or enable it before advertising routes:
+The Nerves system must include kernel TUN support (`CONFIG_TUN`) and expose
+`/dev/net/tun`. Since `/etc` may be immutable, enable forwarding during each
+boot before advertising routes:
 
 ```elixir
-File.write!("/proc/sys/net/ipv4/ip_forward", "1\n")
-File.write!("/proc/sys/net/ipv6/conf/all/forwarding", "1\n")
+:ok = Tailscale.enable_forwarding()
+:ok = Tailscale.advertise_routes(["192.168.1.0/24", "10.0.0.0/24"])
 ```
 
-After the node is authenticated, advertise the required networks through the library:
-
-```elixir
-Tailscale.cli("set", ["--advertise-routes=192.168.1.0/24,10.0.0.0/24"])
-```
-
-The routes must also be approved in the Tailscale admin console or by suitable `autoApprovers` policy. If a target has no TUN device, explicitly select netstack mode with `tun: :userspace`. A custom kernel interface name such as `tun: "ts-nerves0"` is also supported.
+If a target has no TUN device, explicitly select netstack mode with
+`tun: :userspace`. A custom kernel interface name such as `tun: "ts-nerves0"`
+is also supported.
 
 ## Testing
 

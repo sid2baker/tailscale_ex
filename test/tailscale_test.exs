@@ -26,7 +26,7 @@ defmodule TailscaleTest do
       File.rm_rf!(state_dir)
     end)
 
-    %{opts: opts, state_dir: state_dir}
+    %{opts: opts, state_dir: state_dir, mock_dir: mock_dir}
   end
 
   # Helper functions
@@ -63,6 +63,13 @@ defmodule TailscaleTest do
       {:error, reason} ->
         raise "Failed to read daemon arguments: #{inspect(reason)}"
     end
+  end
+
+  defp cli_args(mock_dir) do
+    mock_dir
+    |> Path.join("cli-args")
+    |> File.read!()
+    |> String.split("\n", trim: true)
   end
 
   describe "start_link/1" do
@@ -233,6 +240,52 @@ defmodule TailscaleTest do
       assert result == true
 
       GenServer.stop(pid)
+    end
+  end
+
+  describe "subnet router API" do
+    test "advertises validated IPv4 routes when forwarding is enabled", %{
+      opts: opts,
+      mock_dir: mock_dir
+    } do
+      pid = start_and_wait(opts)
+      routes = ["192.168.1.0/24", "10.0.0.0/8", "192.168.1.0/24"]
+
+      case Tailscale.forwarding_status() do
+        {:ok, %{ipv4: true}} ->
+          assert :ok = Tailscale.advertise_routes(pid, routes)
+          assert cli_args(mock_dir) == ["set", "--advertise-routes=192.168.1.0/24,10.0.0.0/8"]
+
+        {:ok, %{ipv4: false}} ->
+          assert {:error, {:forwarding_disabled, [:ipv4]}} =
+                   Tailscale.advertise_routes(pid, routes)
+
+        {:error, reason} ->
+          flunk("Linux forwarding status is unavailable: #{inspect(reason)}")
+      end
+
+      GenServer.stop(pid)
+    end
+
+    test "rejects invalid routes before invoking the CLI" do
+      assert {:error, {:invalid_route, "invalid"}} = Tailscale.advertise_routes(["invalid"])
+    end
+
+    test "withdraws all advertised routes", %{opts: opts, mock_dir: mock_dir} do
+      pid = start_and_wait(opts)
+
+      assert :ok = Tailscale.withdraw_routes(pid)
+      assert cli_args(mock_dir) == ["set", "--advertise-routes="]
+
+      GenServer.stop(pid)
+    end
+
+    test "exposes forwarding management at the top level" do
+      assert {:ok, %{ipv4: ipv4?, ipv6: ipv6?}} = Tailscale.forwarding_status()
+      assert is_boolean(ipv4?)
+      assert is_boolean(ipv6?)
+      assert function_exported?(Tailscale, :enable_forwarding, 0)
+      assert function_exported?(Tailscale, :enable_forwarding, 1)
     end
   end
 

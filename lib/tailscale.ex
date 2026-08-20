@@ -26,6 +26,8 @@ defmodule Tailscale do
   use GenServer
   require Logger
 
+  alias Tailscale.SubnetRouter
+
   @default_daemon_path "/usr/sbin/tailscaled"
   @default_cli_path "/usr/bin/tailscale"
   @default_tailscale_dir "/data/tailscale"
@@ -34,6 +36,12 @@ defmodule Tailscale do
   @default_tun :kernel
 
   @type tun :: :kernel | :userspace | String.t()
+  @type route :: String.t()
+  @type forwarding_family :: :ipv4 | :ipv6
+  @type forwarding_status :: %{required(:ipv4) => boolean(), required(:ipv6) => boolean()}
+  @type forwarding_option ::
+          {:families, [forwarding_family()]}
+          | {:persist, false | :sysctl_d}
 
   @type option ::
           {:daemon_path, Path.t()}
@@ -154,6 +162,74 @@ defmodule Tailscale do
   @spec status(GenServer.server()) :: {:ok, map()} | {:error, term()}
   def status(server \\ __MODULE__) do
     GenServer.call(server, :status)
+  end
+
+  @doc """
+  Advertises Linux subnet routes through Tailscale.
+
+  The routes must be IPv4 or IPv6 CIDRs. Duplicate routes are removed while
+  preserving their original order. This replaces the complete set of routes
+  currently advertised by this node.
+
+  Kernel forwarding must already be enabled for every address family used. A
+  successful result means the routes were configured locally; they can still
+  require approval in the Tailscale admin console or through `autoApprovers`.
+
+  ## Examples
+
+      Tailscale.advertise_routes(["192.168.1.0/24", "10.0.0.0/24"])
+      Tailscale.advertise_routes(my_server, ["fd00:1234::/64"])
+
+  """
+  @spec advertise_routes(GenServer.server(), [route()]) :: :ok | {:error, term()}
+  def advertise_routes(server \\ __MODULE__, routes) do
+    with {:ok, %{argument: argument, families: families}} <-
+           SubnetRouter.advertisement(routes),
+         :ok <- SubnetRouter.require_forwarding(families),
+         {:ok, _output} <- cli(server, "set", [argument]) do
+      :ok
+    end
+  end
+
+  @doc """
+  Withdraws all subnet routes advertised by this node.
+  """
+  @spec withdraw_routes(GenServer.server()) :: :ok | {:error, term()}
+  def withdraw_routes(server \\ __MODULE__) do
+    with :ok <- SubnetRouter.ensure_supported(),
+         {:ok, _output} <- cli(server, "set", ["--advertise-routes="]) do
+      :ok
+    end
+  end
+
+  @doc """
+  Returns whether Linux IPv4 and IPv6 forwarding are enabled.
+  """
+  @spec forwarding_status() :: {:ok, forwarding_status()} | {:error, term()}
+  def forwarding_status do
+    SubnetRouter.forwarding_status()
+  end
+
+  @doc """
+  Enables Linux kernel forwarding.
+
+  By default both IPv4 and IPv6 forwarding are enabled for the current boot by
+  writing directly to `/proc`. Use `families: [:ipv4]` or `families: [:ipv6]`
+  to enable only one family.
+
+  Pass `persist: :sysctl_d` to also write an idempotent
+  `/etc/sysctl.d/99-tailscale.conf`. The calling OS process must have permission
+  to write these files; this function never invokes `sudo`.
+
+  ## Examples
+
+      Tailscale.enable_forwarding()
+      Tailscale.enable_forwarding(families: [:ipv4], persist: :sysctl_d)
+
+  """
+  @spec enable_forwarding([forwarding_option()]) :: :ok | {:error, term()}
+  def enable_forwarding(opts \\ []) do
+    SubnetRouter.enable_forwarding(opts)
   end
 
   @doc """
