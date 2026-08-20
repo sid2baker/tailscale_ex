@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MIX_ENV: test
+
+jobs:
+  unit:
+    name: Unit tests and quality checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19"
+
+      - name: Install build tools and dependencies
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: Run CI checks
+        run: mix ci
+
+  tailscale-compatibility:
+    name: Tailscale compatibility (${{ matrix.channel }}, ${{ matrix.tailscale-version }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: stable
+            tailscale-version: latest
+            experimental: false
+          - channel: unstable
+            tailscale-version: unstable
+            experimental: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19"
+
+      - name: Install build tools and dependencies
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: Set up Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: ${{ matrix.tailscale-version }}
+
+      - name: Verify Tailscale version and connection
+        run: |
+          tailscale version
+          tailscale status
+
+      - name: Build library
+        run: mix compile --warnings-as-errors
+
+      - name: Run Tailscale integration tests
+        run: mix test --only integration test/integration/tailscale_integration_test.exs
+
+      - name: Show Tailscale diagnostics after failure
+        if: failure()
+        run: |
+          if command -v tailscale >/dev/null 2>&1; then
+            tailscale version || true
+            tailscale status || true
+          else
+            echo "tailscale executable was not installed"
+          fi

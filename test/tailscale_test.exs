@@ -72,6 +72,22 @@ defmodule TailscaleTest do
       GenServer.stop(pid)
     end
 
+    test "uses an existing daemon when daemon management is disabled", %{opts: opts} do
+      opts =
+        opts
+        |> Keyword.put(:start_daemon, false)
+        |> Keyword.put(:daemon_path, "/nonexistent/tailscaled")
+
+      assert {:ok, pid} = Tailscale.start_link(opts)
+      assert {:ok, "1.88.3"} = Tailscale.version(pid)
+      assert {:error, :not_started} = Tailscale.daemon_pid(pid)
+      assert Tailscale.online?(pid)
+      assert {:ok, %{"Self" => %{"Online" => true}}} = Tailscale.status(pid)
+      assert {:ok, "100.64.0.1\nfd7a:115c:a1e0::1"} = Tailscale.cli(pid, "ip", [])
+
+      GenServer.stop(pid)
+    end
+
     test "returns validation error when daemon binary does not exist", %{opts: opts} do
       opts = Keyword.put(opts, :daemon_path, "/nonexistent/tailscaled")
       assert {:error, message} = Tailscale.start_link(opts)
@@ -350,6 +366,7 @@ defmodule TailscaleTest do
       assert Process.alive?(daemon_pid)
 
       GenServer.stop(pid)
+      refute Process.alive?(daemon_pid)
     end
   end
 

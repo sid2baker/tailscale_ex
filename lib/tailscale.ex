@@ -35,6 +35,7 @@ defmodule Tailscale do
   @type option ::
           {:daemon_path, Path.t()}
           | {:cli_path, Path.t()}
+          | {:start_daemon, boolean()}
           | {:tailscale_dir, Path.t()}
           | {:socket_path, Path.t()}
           | {:timeout, non_neg_integer()}
@@ -48,6 +49,7 @@ defmodule Tailscale do
       :daemon_pid,
       :daemon_path,
       :cli_path,
+      :start_daemon,
       :socket_path,
       :tailscale_dir,
       :version,
@@ -58,6 +60,7 @@ defmodule Tailscale do
             daemon_pid: pid() | nil,
             daemon_path: Path.t(),
             cli_path: Path.t(),
+            start_daemon: boolean(),
             socket_path: Path.t(),
             tailscale_dir: Path.t(),
             version: String.t() | nil,
@@ -75,6 +78,7 @@ defmodule Tailscale do
     * `:name` - Name for the GenServer (default: `#{__MODULE__}`)
     * `:daemon_path` - Path to the `tailscaled` binary (default: `#{@default_daemon_path}`)
     * `:cli_path` - Path to the `tailscale` CLI binary (default: `#{@default_cli_path}`)
+    * `:start_daemon` - Start and manage `tailscaled`; set to `false` to use an existing daemon (default: `true`)
     * `:socket_path` - Path to the Unix socket (default: `#{@default_socket_path}`)
     * `:tailscale_dir` - Directory for Tailscale state (default: `#{@default_tailscale_dir}`)
     * `:timeout` - Command timeout in milliseconds (default: `#{@default_timeout}`)
@@ -85,17 +89,17 @@ defmodule Tailscale do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
     daemon_path = Keyword.get(opts, :daemon_path, @default_daemon_path)
     cli_path = Keyword.get(opts, :cli_path, @default_cli_path)
+    start_daemon = Keyword.get(opts, :start_daemon, true)
     socket_path = Keyword.get(opts, :socket_path, @default_socket_path)
     tailscale_dir = Keyword.get(opts, :tailscale_dir, @default_tailscale_dir)
     timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-    with :ok <- validate_executable(daemon_path),
+    with :ok <- validate_daemon(daemon_path, tailscale_dir, start_daemon),
          :ok <- validate_executable(cli_path),
-         :ok <- ensure_directory(Path.dirname(socket_path)),
-         :ok <- ensure_directory(tailscale_dir) do
+         :ok <- ensure_directory(Path.dirname(socket_path)) do
       GenServer.start_link(
         __MODULE__,
-        {daemon_path, cli_path, socket_path, tailscale_dir, timeout},
+        {daemon_path, cli_path, start_daemon, socket_path, tailscale_dir, timeout},
         name: name
       )
     end
@@ -161,10 +165,11 @@ defmodule Tailscale do
   # Server callbacks
 
   @impl true
-  def init({daemon_path, cli_path, socket_path, tailscale_dir, timeout}) do
+  def init({daemon_path, cli_path, start_daemon, socket_path, tailscale_dir, timeout}) do
     state = %State{
       daemon_path: daemon_path,
       cli_path: cli_path,
+      start_daemon: start_daemon,
       tailscale_dir: tailscale_dir,
       socket_path: socket_path,
       daemon_pid: nil,
@@ -187,15 +192,21 @@ defmodule Tailscale do
 
     Logger.info("Tailscale version: #{version}")
 
-    # Start daemon
-    case start_daemon(state) do
-      {:ok, pid} ->
-        Logger.info("Tailscale daemon started with PID #{inspect(pid)}")
-        {:noreply, %{state | daemon_pid: pid, version: version}}
+    state = %{state | version: version}
 
-      {:error, reason} ->
-        Logger.error("Failed to start Tailscale daemon: #{inspect(reason)}")
-        {:stop, reason, state}
+    if state.start_daemon do
+      case start_daemon(state) do
+        {:ok, pid} ->
+          Logger.info("Tailscale daemon started with PID #{inspect(pid)}")
+          {:noreply, %{state | daemon_pid: pid}}
+
+        {:error, reason} ->
+          Logger.error("Failed to start Tailscale daemon: #{inspect(reason)}")
+          {:stop, reason, state}
+      end
+    else
+      Logger.info("Using existing Tailscale daemon at #{state.socket_path}")
+      {:noreply, state}
     end
   end
 
@@ -224,7 +235,7 @@ defmodule Tailscale do
     end
   end
 
-  def handle_call(_msg, _from, %State{daemon_pid: nil} = state) do
+  def handle_call(:daemon_pid, _from, %State{daemon_pid: nil} = state) do
     {:reply, {:error, :not_started}, state}
   end
 
@@ -249,8 +260,12 @@ defmodule Tailscale do
   end
 
   @impl true
-  def terminate(reason, state) do
+  def terminate(reason, %State{daemon_pid: daemon_pid}) do
     Logger.warning("Tailscale GenServer terminating. Reason: #{inspect(reason)}")
+
+    if is_pid(daemon_pid) and Process.alive?(daemon_pid) do
+      GenServer.stop(daemon_pid)
+    end
 
     :ok
   end
@@ -269,7 +284,7 @@ defmodule Tailscale do
     )
   end
 
-  defp exec_command(state, command, args \\ []) when is_list(args) do
+  defp exec_command(state, command, args) when is_list(args) do
     # Add --socket flag to all commands.
     # It needs to be the first argument for tailscale to work correctly.
     args_with_socket = ["--socket=#{state.socket_path}", command] ++ args
@@ -294,6 +309,18 @@ defmodule Tailscale do
       {output, exit_code} ->
         {:error, {exit_code, String.trim(output)}}
     end
+  end
+
+  defp validate_daemon(_daemon_path, _tailscale_dir, false), do: :ok
+
+  defp validate_daemon(daemon_path, tailscale_dir, true) do
+    with :ok <- validate_executable(daemon_path) do
+      ensure_directory(tailscale_dir)
+    end
+  end
+
+  defp validate_daemon(_daemon_path, _tailscale_dir, _start_daemon) do
+    {:error, ":start_daemon must be a boolean"}
   end
 
   defp validate_executable(path) do

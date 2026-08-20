@@ -66,6 +66,7 @@ end
 | `:name`          | `Tailscale`                       | GenServer name               |
 | `:daemon_path`   | `/usr/sbin/tailscaled`            | Path to daemon binary        |
 | `:cli_path`      | `/usr/bin/tailscale`              | Path to CLI binary           |
+| `:start_daemon`  | `true`                            | Manage a daemon or use an existing one |
 | `:socket_path`   | `/run/tailscale/tailscaled.sock`  | Unix socket path             |
 | `:tailscale_dir` | `/data/tailscale`                 | State directory              |
 | `:timeout`       | `5_000`                           | Command timeout (ms)         |
@@ -83,6 +84,33 @@ For embedded/Nerves projects:
   socket_path: "/run/tailscale/tailscale.sock",
   tailscale_dir: "/data/tailscale"}
 ```
+
+## Testing
+
+Unit tests use mock `tailscale` and `tailscaled` binaries and do not require a tailnet:
+
+```bash
+mix ci
+```
+
+The integration test uses the installed Tailscale CLI and a real, connected daemon. It exercises this library's version parsing, JSON status parsing, online detection, and IP command handling:
+
+```bash
+mix test --only integration test/integration/tailscale_integration_test.exs
+```
+
+The test defaults to `/var/run/tailscale/tailscaled.sock`. Set `TAILSCALE_SOCKET` or `TAILSCALE_CLI_PATH` when reproducing against a non-default local installation. The test attaches with `start_daemon: false`, so it does not stop or replace the machine's existing daemon.
+
+### Tailscale compatibility CI
+
+`.github/workflows/ci.yml` runs the unit suite independently and then uses `tailscale/github-action@v4` to create an ephemeral `tag:ci` node. Pull requests are tested against `version: latest`; a separate `unstable` matrix entry is an allowed-to-fail early warning.
+
+The action authenticates with GitHub OIDC workload identity federation. Maintainers must configure these GitHub Actions secrets:
+
+- `TS_OAUTH_CLIENT_ID` — the Tailscale federated identity client ID
+- `TS_AUDIENCE` — its configured audience
+
+The Tailscale trust credential must have writable `auth_keys` scope and permission to create nodes tagged `tag:ci`. The workflow requests `id-token: write`; no reusable auth key or OAuth client secret is stored in the repository. The action marks its node ephemeral and logs it out after the job.
 
 ## Troubleshooting
 
