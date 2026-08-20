@@ -69,8 +69,8 @@ end
 | `:start_daemon`  | `true`                            | Manage a daemon or use an existing one |
 | `:socket_path`   | `/run/tailscale/tailscaled.sock`  | Unix socket path             |
 | `:tailscale_dir` | `/data/tailscale`                 | State directory              |
+| `:tun`           | `:kernel`                         | Kernel, userspace, or custom TUN interface |
 | `:timeout`       | `5_000`                           | Command timeout (ms)         |
-
 
 ## Nerves Integration
 
@@ -82,8 +82,26 @@ For embedded/Nerves projects:
   daemon_path: "/data/tailscaled",
   cli_path: "/data/tailscale",
   socket_path: "/run/tailscale/tailscale.sock",
-  tailscale_dir: "/data/tailscale"}
+  tailscale_dir: "/data/tailscale",
+  tun: :kernel}
 ```
+
+Kernel TUN mode is the default. It follows the upstream `tailscaled` default interface (`tailscale0`) by omitting the `--tun` flag. This is the recommended mode for a Nerves subnet router because it supports all IP protocols and uses the Linux routing stack.
+
+The Nerves system must include kernel TUN support (`CONFIG_TUN`) and expose `/dev/net/tun`. Subnet routing also requires kernel forwarding. Configure it during boot, or enable it before advertising routes:
+
+```elixir
+File.write!("/proc/sys/net/ipv4/ip_forward", "1\n")
+File.write!("/proc/sys/net/ipv6/conf/all/forwarding", "1\n")
+```
+
+After the node is authenticated, advertise the required networks through the library:
+
+```elixir
+Tailscale.cli("set", ["--advertise-routes=192.168.1.0/24,10.0.0.0/24"])
+```
+
+The routes must also be approved in the Tailscale admin console or by suitable `autoApprovers` policy. If a target has no TUN device, explicitly select netstack mode with `tun: :userspace`. A custom kernel interface name such as `tun: "ts-nerves0"` is also supported.
 
 ## Testing
 
@@ -121,6 +139,7 @@ Check that:
 - Socket directory is writable
 - State directory is writable
 - No other Tailscale instance is using the same socket
+- `/dev/net/tun` exists when using the default `:kernel` mode
 
 ### Commands timeout
 

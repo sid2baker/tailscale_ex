@@ -51,11 +51,50 @@ defmodule TailscaleTest do
     end
   end
 
+  defp wait_for_daemon_args(state_dir, attempts \\ 50) do
+    case File.read(Path.join(state_dir, "daemon-args")) do
+      {:ok, args} ->
+        args |> String.trim() |> String.split("\n")
+
+      {:error, _reason} when attempts > 0 ->
+        Process.sleep(10)
+        wait_for_daemon_args(state_dir, attempts - 1)
+
+      {:error, reason} ->
+        raise "Failed to read daemon arguments: #{inspect(reason)}"
+    end
+  end
+
   describe "start_link/1" do
-    test "starts with default options", %{opts: opts} do
+    test "uses kernel TUN mode by default", %{opts: opts, state_dir: state_dir} do
       pid = start_and_wait(opts)
+      daemon_args = wait_for_daemon_args(state_dir)
+
       assert Process.alive?(pid)
+      refute Enum.any?(daemon_args, &String.starts_with?(&1, "--tun="))
+
       GenServer.stop(pid)
+    end
+
+    test "supports userspace networking mode", %{opts: opts, state_dir: state_dir} do
+      pid = opts |> Keyword.put(:tun, :userspace) |> start_and_wait()
+
+      assert "--tun=userspace-networking" in wait_for_daemon_args(state_dir)
+
+      GenServer.stop(pid)
+    end
+
+    test "supports a custom TUN interface", %{opts: opts, state_dir: state_dir} do
+      pid = opts |> Keyword.put(:tun, "ts-nerves0") |> start_and_wait()
+
+      assert "--tun=ts-nerves0" in wait_for_daemon_args(state_dir)
+
+      GenServer.stop(pid)
+    end
+
+    test "rejects an invalid TUN mode", %{opts: opts} do
+      assert {:error, message} = opts |> Keyword.put(:tun, nil) |> Tailscale.start_link()
+      assert message =~ ":tun must be"
     end
 
     test "starts with custom name", %{opts: opts} do

@@ -59,6 +59,10 @@ defmodule MockTailscale do
     #!/bin/bash
     # Mock tailscale CLI for testing
 
+    # Give MuonTrap time to acknowledge captured output before this short-lived
+    # process closes its pipes.
+    trap 'sleep 0.01' EXIT
+
     # Strip out --socket flag if present
     args=()
     for arg in "$@"; do
@@ -273,9 +277,10 @@ defmodule MockTailscale do
       esac
     done
 
-    # Create state directory if specified
+    # Create state directory and record arguments if specified
     if [ -n "$STATEDIR" ]; then
       mkdir -p "$STATEDIR"
+      printf '%s\n' "$@" > "$STATEDIR/daemon-args"
     fi
 
     # Mock daemon just sleeps

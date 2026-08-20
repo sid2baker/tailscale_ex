@@ -31,6 +31,9 @@ defmodule Tailscale do
   @default_tailscale_dir "/data/tailscale"
   @default_socket_path "/run/tailscale/tailscaled.sock"
   @default_timeout 5_000
+  @default_tun :kernel
+
+  @type tun :: :kernel | :userspace | String.t()
 
   @type option ::
           {:daemon_path, Path.t()}
@@ -38,6 +41,7 @@ defmodule Tailscale do
           | {:start_daemon, boolean()}
           | {:tailscale_dir, Path.t()}
           | {:socket_path, Path.t()}
+          | {:tun, tun()}
           | {:timeout, non_neg_integer()}
           | {:name, atom()}
 
@@ -52,6 +56,7 @@ defmodule Tailscale do
       :start_daemon,
       :socket_path,
       :tailscale_dir,
+      :tun,
       :version,
       :timeout
     ]
@@ -63,6 +68,7 @@ defmodule Tailscale do
             start_daemon: boolean(),
             socket_path: Path.t(),
             tailscale_dir: Path.t(),
+            tun: Tailscale.tun(),
             version: String.t() | nil,
             timeout: non_neg_integer()
           }
@@ -81,6 +87,7 @@ defmodule Tailscale do
     * `:start_daemon` - Start and manage `tailscaled`; set to `false` to use an existing daemon (default: `true`)
     * `:socket_path` - Path to the Unix socket (default: `#{@default_socket_path}`)
     * `:tailscale_dir` - Directory for Tailscale state (default: `#{@default_tailscale_dir}`)
+    * `:tun` - TUN mode: `:kernel`, `:userspace`, or a custom interface name (default: `#{inspect(@default_tun)}`)
     * `:timeout` - Command timeout in milliseconds (default: `#{@default_timeout}`)
 
   """
@@ -92,14 +99,16 @@ defmodule Tailscale do
     start_daemon = Keyword.get(opts, :start_daemon, true)
     socket_path = Keyword.get(opts, :socket_path, @default_socket_path)
     tailscale_dir = Keyword.get(opts, :tailscale_dir, @default_tailscale_dir)
+    tun = Keyword.get(opts, :tun, @default_tun)
     timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-    with :ok <- validate_daemon(daemon_path, tailscale_dir, start_daemon),
+    with :ok <- validate_tun(tun),
+         :ok <- validate_daemon(daemon_path, tailscale_dir, start_daemon),
          :ok <- validate_executable(cli_path),
          :ok <- ensure_directory(Path.dirname(socket_path)) do
       GenServer.start_link(
         __MODULE__,
-        {daemon_path, cli_path, start_daemon, socket_path, tailscale_dir, timeout},
+        {daemon_path, cli_path, start_daemon, socket_path, tailscale_dir, tun, timeout},
         name: name
       )
     end
@@ -165,7 +174,7 @@ defmodule Tailscale do
   # Server callbacks
 
   @impl true
-  def init({daemon_path, cli_path, start_daemon, socket_path, tailscale_dir, timeout}) do
+  def init({daemon_path, cli_path, start_daemon, socket_path, tailscale_dir, tun, timeout}) do
     state = %State{
       daemon_path: daemon_path,
       cli_path: cli_path,
@@ -173,6 +182,7 @@ defmodule Tailscale do
       tailscale_dir: tailscale_dir,
       socket_path: socket_path,
       daemon_pid: nil,
+      tun: tun,
       version: nil,
       timeout: timeout
     }
@@ -273,15 +283,13 @@ defmodule Tailscale do
   # Private functions
 
   defp start_daemon(state) do
-    MuonTrap.Daemon.start_link(
-      state.daemon_path,
+    daemon_args =
       [
-        "--tun=userspace-networking",
         "--statedir=#{state.tailscale_dir}",
         "--socket=#{state.socket_path}"
-      ],
-      log_output: :info
-    )
+      ] ++ tun_args(state.tun)
+
+    MuonTrap.Daemon.start_link(state.daemon_path, daemon_args, log_output: :info)
   end
 
   defp exec_command(state, command, args) when is_list(args) do
@@ -309,6 +317,24 @@ defmodule Tailscale do
       {output, exit_code} ->
         {:error, {exit_code, String.trim(output)}}
     end
+  end
+
+  defp tun_args(:kernel), do: []
+  defp tun_args(:userspace), do: ["--tun=userspace-networking"]
+  defp tun_args(interface_name), do: ["--tun=#{interface_name}"]
+
+  defp validate_tun(tun) when tun in [:kernel, :userspace], do: :ok
+
+  defp validate_tun(tun) when is_binary(tun) do
+    if String.trim(tun) == "" do
+      {:error, ":tun interface name cannot be empty"}
+    else
+      :ok
+    end
+  end
+
+  defp validate_tun(_tun) do
+    {:error, ":tun must be :kernel, :userspace, or an interface name"}
   end
 
   defp validate_daemon(_daemon_path, _tailscale_dir, false), do: :ok
