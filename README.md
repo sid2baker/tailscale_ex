@@ -7,6 +7,7 @@ An Elixir wrapper for [Tailscale](https://tailscale.com), providing a supervised
 - 🚀 **Supervised daemon management** - Full lifecycle control via `MuonTrap`
 - 🔌 **Custom socket paths** - Works in embedded/Nerves environments
 - ⏱️ **Configurable timeouts** - Prevent hanging commands
+- 📦 **Linux binary installer** - Detects the runtime ABI and installs verified, pinned binaries
 
 ## Installation
 
@@ -71,6 +72,39 @@ end
 | `:tailscale_dir` | `/data/tailscale`                 | State directory              |
 | `:tun`           | `:kernel`                         | Kernel, userspace, or custom TUN interface |
 | `:timeout`       | `5_000`                           | Command timeout (ms)         |
+
+## Installing Linux binaries dynamically
+
+`Tailscale.Binary` can detect the ABI of the running Linux BEAM and install a
+pinned Tailscale release. Installation is explicit and never happens as a side
+effect of `Tailscale.start_link/1`:
+
+```elixir
+{:ok, binaries} =
+  Tailscale.Binary.ensure_installed(
+    version: "1.102.3",
+    install_dir: "/data/tailscale/bin"
+  )
+
+{:ok, pid} =
+  Tailscale.start_link(
+    daemon_path: binaries.daemon_path,
+    cli_path: binaries.cli_path
+  )
+```
+
+The installer supports Tailscale's Linux `amd64`, `386`, `arm`, `arm64`,
+`mips`, `mipsle`, `mips64`, `mips64le`, and `riscv64` archives. It uses the
+BEAM runtime ABI rather than the physical CPU, downloads both binaries from the
+official stable package repository, verifies the published SHA-256 checksum,
+and atomically caches them by version and architecture.
+
+An exact `:version` is required. You can provide an independently trusted
+checksum with `sha256: "..."`, or a custom CA bundle with
+`cacertfile: "/path/to/cacerts.pem"`. The installation directory must be
+persistent and writable. For reproducible Nerves production firmware, bundling
+pinned binaries at build time remains preferable to downloading them during
+boot.
 
 ## Nerves Integration
 
