@@ -243,49 +243,165 @@ defmodule TailscaleTest do
     end
   end
 
-  describe "subnet router API" do
-    test "advertises validated IPv4 routes when forwarding is enabled", %{
+  describe "typed preferences" do
+    test "sets only explicitly supplied routes with tailscale set", %{
       opts: opts,
       mock_dir: mock_dir
     } do
       pid = start_and_wait(opts)
-      routes = ["192.168.1.0/24", "10.0.0.0/8", "192.168.1.0/24"]
 
-      case Tailscale.forwarding_status() do
-        {:ok, %{ipv4: true}} ->
-          assert :ok = Tailscale.advertise_routes(pid, routes)
-          assert cli_args(mock_dir) == ["set", "--advertise-routes=192.168.1.0/24,10.0.0.0/8"]
+      assert :ok =
+               Tailscale.set(pid,
+                 advertise_routes: [
+                   "192.168.10.42/24",
+                   "10.20.0.0/16",
+                   "192.168.10.0/24"
+                 ]
+               )
 
-        {:ok, %{ipv4: false}} ->
-          assert {:error, {:forwarding_disabled, [:ipv4]}} =
-                   Tailscale.advertise_routes(pid, routes)
-
-        {:error, reason} ->
-          flunk("Linux forwarding status is unavailable: #{inspect(reason)}")
-      end
+      assert cli_args(mock_dir) == [
+               "set",
+               "--advertise-routes=192.168.10.0/24,10.20.0.0/16"
+             ]
 
       GenServer.stop(pid)
     end
 
-    test "rejects invalid routes before invoking the CLI" do
-      assert {:error, {:invalid_route, "invalid"}} = Tailscale.advertise_routes(["invalid"])
-    end
-
-    test "withdraws all advertised routes", %{opts: opts, mock_dir: mock_dir} do
+    test "withdraws routes with an empty list and normalizes empty output", %{
+      opts: opts,
+      mock_dir: mock_dir
+    } do
       pid = start_and_wait(opts)
 
-      assert :ok = Tailscale.withdraw_routes(pid)
+      assert :ok = Tailscale.set(pid, advertise_routes: [])
       assert cli_args(mock_dir) == ["set", "--advertise-routes="]
 
       GenServer.stop(pid)
     end
 
-    test "exposes forwarding management at the top level" do
+    test "rejects invalid or unsupported preference changes before invoking the CLI", %{
+      opts: opts,
+      mock_dir: mock_dir
+    } do
+      pid = start_and_wait(opts)
+      initial_args = cli_args(mock_dir)
+
+      assert {:error, {:invalid_route, "invalid"}} =
+               Tailscale.set(pid, advertise_routes: ["invalid"])
+
+      assert {:error, {:unsupported_preference, :accept_dns}} =
+               Tailscale.set(pid, accept_dns: true)
+
+      assert {:error, :preferences_required} = Tailscale.set(pid, [])
+      assert cli_args(mock_dir) == initial_args
+
+      GenServer.stop(pid)
+    end
+
+    test "returns structured errors when tailscale set fails", %{opts: opts, mock_dir: mock_dir} do
+      pid = start_and_wait(opts)
+      File.touch!(Path.join(mock_dir, "set-error"))
+
+      assert {:error,
+              %Tailscale.CommandError{
+                command: "set",
+                exit_code: 1,
+                output: "failed to update preferences",
+                reason: :exit_status
+              }} = Tailscale.set(pid, advertise_routes: ["192.168.10.0/24"])
+
+      GenServer.stop(pid)
+    end
+
+    test "reads back a typed preference model", %{opts: opts} do
+      pid = start_and_wait(opts)
+      routes = ["192.168.10.0/24", "fd00:1234::/64"]
+
+      assert :ok = Tailscale.set(pid, advertise_routes: routes)
+
+      assert {:ok, %Tailscale.Preferences{advertised_routes: ^routes}} =
+               Tailscale.preferences(pid)
+
+      assert {:ok, ^routes} = Tailscale.advertised_routes(pid)
+
+      GenServer.stop(pid)
+    end
+
+    test "projects advertised, approved, and primary routes", %{opts: opts, mock_dir: mock_dir} do
+      pid = start_and_wait(opts)
+      advertised = ["192.168.10.0/24", "10.20.0.0/16"]
+
+      :ok =
+        MockTailscale.configure_route_status(mock_dir,
+          approved: ["192.168.10.0/24", "10.20.0.0/16"],
+          primary: ["192.168.10.0/24"]
+        )
+
+      assert :ok = Tailscale.set(pid, advertise_routes: advertised)
+
+      assert {:ok,
+              %{
+                advertised: ^advertised,
+                approved: ["192.168.10.0/24", "10.20.0.0/16"],
+                primary: ["192.168.10.0/24"]
+              }} = Tailscale.route_status(pid)
+
+      GenServer.stop(pid)
+    end
+
+    test "exposes forwarding management separately" do
       assert {:ok, %{ipv4: ipv4?, ipv6: ipv6?}} = Tailscale.forwarding_status()
       assert is_boolean(ipv4?)
       assert is_boolean(ipv6?)
       assert function_exported?(Tailscale, :enable_forwarding, 0)
       assert function_exported?(Tailscale, :enable_forwarding, 1)
+    end
+  end
+
+  describe "await_ready/2" do
+    test "returns when the daemon accepts status commands", %{opts: opts} do
+      pid = start_and_wait(opts)
+
+      assert :ok = Tailscale.await_ready(pid, timeout: 1_000, interval: 10)
+
+      GenServer.stop(pid)
+    end
+
+    test "retries transient daemon connection failures", %{opts: opts, mock_dir: mock_dir} do
+      pid = start_and_wait(opts)
+      :ok = MockTailscale.configure_status_failures(mock_dir, 2)
+
+      assert :ok = Tailscale.await_ready(pid, timeout: 1_000, interval: 5)
+      assert File.read!(Path.join(mock_dir, "status-failures")) == "0"
+
+      GenServer.stop(pid)
+    end
+
+    test "rejects invalid readiness options", %{opts: opts} do
+      pid = start_and_wait(opts)
+
+      assert {:error, {:invalid_readiness_options, [timeout: 0]}} =
+               Tailscale.await_ready(pid, timeout: 0)
+
+      assert {:error, {:invalid_readiness_options, [unknown: true]}} =
+               Tailscale.await_ready(pid, unknown: true)
+
+      GenServer.stop(pid)
+    end
+
+    test "returns the last structured error after its deadline", %{opts: opts, mock_dir: mock_dir} do
+      pid = start_and_wait(opts)
+      :ok = MockTailscale.configure_status_failures(mock_dir, 100)
+
+      assert {:error,
+              {:readiness_timeout,
+               %Tailscale.CommandError{
+                 command: "status",
+                 exit_code: 1,
+                 reason: :exit_status
+               }}} = Tailscale.await_ready(pid, timeout: 50, interval: 5)
+
+      GenServer.stop(pid)
     end
   end
 
@@ -361,11 +477,17 @@ defmodule TailscaleTest do
       GenServer.stop(pid)
     end
 
-    test "returns error for unknown command", %{opts: opts} do
+    test "returns a structured error for an unknown command", %{opts: opts} do
       pid = start_and_wait(opts)
 
-      assert {:error, {exit_code, output}} = Tailscale.cli(pid, "invalid", [])
-      assert exit_code == 1
+      assert {:error,
+              %Tailscale.CommandError{
+                command: "invalid",
+                exit_code: 1,
+                output: output,
+                reason: :exit_status
+              }} = Tailscale.cli(pid, "invalid", [])
+
       assert output =~ "unknown command"
 
       GenServer.stop(pid)

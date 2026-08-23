@@ -22,23 +22,19 @@ defmodule Tailscale.SubnetRouterTest do
     %{paths: paths}
   end
 
-  describe "advertisement/1" do
-    test "validates and deduplicates IPv4 and IPv6 routes" do
-      assert {:ok,
-              %{
-                argument: "--advertise-routes=192.168.1.0/24,10.0.0.0/8,fd00:1234::/64",
-                families: [:ipv4, :ipv6]
-              }} =
-               SubnetRouter.advertisement([
-                 " 192.168.1.0/24 ",
+  describe "normalize_routes/1" do
+    test "canonicalizes and deduplicates IPv4 and IPv6 routes" do
+      assert {:ok, ["192.168.1.0/24", "10.0.0.0/8", "fd00:1234::/64"]} =
+               SubnetRouter.normalize_routes([
+                 " 192.168.1.42/24 ",
                  "10.0.0.0/8",
                  "192.168.1.0/24",
-                 "fd00:1234::/64"
+                 "fd00:1234::abcd/64"
                ])
     end
 
-    test "rejects an empty route list" do
-      assert {:error, :routes_required} = SubnetRouter.advertisement([])
+    test "accepts an empty route list" do
+      assert {:ok, []} = SubnetRouter.normalize_routes([])
     end
 
     test "rejects malformed addresses and prefixes" do
@@ -52,15 +48,15 @@ defmodule Tailscale.SubnetRouterTest do
       ]
 
       for route <- invalid_routes do
-        assert {:error, {:invalid_route, ^route}} = SubnetRouter.advertisement([route])
+        assert {:error, {:invalid_route, ^route}} = SubnetRouter.normalize_routes([route])
       end
     end
 
     test "rejects non-list and non-string routes" do
       assert {:error, {:invalid_routes, "192.168.1.0/24"}} =
-               SubnetRouter.advertisement("192.168.1.0/24")
+               SubnetRouter.normalize_routes("192.168.1.0/24")
 
-      assert {:error, {:invalid_route, :invalid}} = SubnetRouter.advertisement([:invalid])
+      assert {:error, {:invalid_route, :invalid}} = SubnetRouter.normalize_routes([:invalid])
     end
   end
 
@@ -87,22 +83,6 @@ defmodule Tailscale.SubnetRouterTest do
                SubnetRouter.forwarding_status(paths)
 
       assert path == paths.ipv4
-    end
-  end
-
-  describe "require_forwarding/2" do
-    test "checks only the families required by advertised routes", %{paths: paths} do
-      File.write!(paths.ipv4, "1\n")
-
-      assert :ok = SubnetRouter.require_forwarding([:ipv4], paths)
-
-      assert {:error, {:forwarding_disabled, [:ipv6]}} =
-               SubnetRouter.require_forwarding([:ipv6], paths)
-    end
-
-    test "reports all disabled families in input order", %{paths: paths} do
-      assert {:error, {:forwarding_disabled, [:ipv6, :ipv4]}} =
-               SubnetRouter.require_forwarding([:ipv6, :ipv4], paths)
     end
   end
 
@@ -141,6 +121,9 @@ defmodule Tailscale.SubnetRouterTest do
 
       assert {:error, {:invalid_option, :persist, true}} =
                SubnetRouter.enable_forwarding([persist: true], paths)
+
+      assert {:error, {:invalid_options, [unknown: true]}} =
+               SubnetRouter.enable_forwarding([unknown: true], paths)
     end
   end
 end

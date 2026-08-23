@@ -8,7 +8,7 @@ An Elixir wrapper for [Tailscale](https://tailscale.com), providing a supervised
 - 🔌 **Custom socket paths** - Works in embedded/Nerves environments
 - ⏱️ **Configurable timeouts** - Prevent hanging commands
 - 📦 **Linux binary installer** - Detects the runtime ABI and installs verified, pinned binaries
-- 🌐 **Subnet router API** - Enables Linux forwarding and advertises validated routes
+- 🌐 **Typed route preferences** - Configures, reads, and reconciles subnet routing state
 
 ## Installation
 
@@ -131,17 +131,37 @@ Advertise IPv4 or IPv6 CIDRs after the node is authenticated:
 
 ```elixir
 :ok =
-  Tailscale.advertise_routes([
-    "192.168.1.0/24",
-    "10.0.0.0/24"
-  ])
+  Tailscale.set(
+    advertise_routes: [
+      "192.168.1.0/24",
+      "10.0.0.0/24"
+    ]
+  )
 ```
 
-`advertise_routes/1` validates and deduplicates the CIDRs, verifies forwarding
-for the address families involved, and replaces the complete advertised route
-set. Withdraw all routes with `Tailscale.withdraw_routes/0`. Routes must still
-be approved in the Tailscale admin console or by suitable `autoApprovers`
-policy.
+`set/1` validates, canonicalizes, and deduplicates CIDRs. It invokes
+`tailscale set`, so preferences not explicitly supplied remain unchanged. Pass
+an empty list to withdraw every advertised route:
+
+```elixir
+:ok = Tailscale.set(advertise_routes: [])
+```
+
+Read back configured preferences or compare local configuration with the
+control-plane view:
+
+```elixir
+{:ok, %Tailscale.Preferences{advertised_routes: routes}} =
+  Tailscale.preferences()
+
+{:ok, %{advertised: advertised, approved: approved, primary: primary}} =
+  Tailscale.route_status()
+```
+
+Routes must still be approved in the Tailscale admin console or by suitable
+`autoApprovers` policy. Forwarding configuration is deliberately separate from
+preference updates, allowing desired settings to be persisted and reconciled
+independently.
 
 ## Nerves Integration
 
@@ -165,8 +185,12 @@ boot before advertising routes:
 
 ```elixir
 :ok = Tailscale.enable_forwarding()
-:ok = Tailscale.advertise_routes(["192.168.1.0/24", "10.0.0.0/24"])
+:ok = Tailscale.await_ready(timeout: 10_000)
+:ok = Tailscale.set(advertise_routes: ["192.168.1.0/24", "10.0.0.0/24"])
 ```
+
+`await_ready/1` only waits for the daemon socket to accept commands. It also
+succeeds in pre-enrollment states such as `NeedsLogin`.
 
 If a target has no TUN device, explicitly select netstack mode with
 `tun: :userspace`. A custom kernel interface name such as `tun: "ts-nerves0"`

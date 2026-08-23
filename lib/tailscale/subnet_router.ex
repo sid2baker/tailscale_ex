@@ -1,6 +1,8 @@
 defmodule Tailscale.SubnetRouter do
   @moduledoc false
 
+  import Bitwise
+
   @default_paths %{
     ipv4: "/proc/sys/net/ipv4/ip_forward",
     ipv6: "/proc/sys/net/ipv6/conf/all/forwarding",
@@ -13,28 +15,23 @@ defmodule Tailscale.SubnetRouter do
           required(:ipv6) => Path.t(),
           required(:sysctl) => Path.t()
         }
-  @type advertisement :: %{required(:argument) => String.t(), required(:families) => [family()]}
 
-  @spec advertisement(term()) :: {:ok, advertisement()} | {:error, term()}
-  def advertisement([]), do: {:error, :routes_required}
-
-  def advertisement(routes) when is_list(routes) do
-    with {:ok, parsed_routes} <- parse_routes(routes) do
-      unique_routes = Enum.uniq_by(parsed_routes, &elem(&1, 0))
-
-      {:ok,
-       %{
-         argument: "--advertise-routes=#{unique_routes |> Enum.map_join(",", &elem(&1, 0))}",
-         families: unique_routes |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
-       }}
-    end
+  @spec normalize_routes(term()) :: {:ok, [String.t()]} | {:error, term()}
+  def normalize_routes(routes) when is_list(routes) do
+    routes
+    |> Enum.reduce_while({:ok, []}, fn route, {:ok, parsed} ->
+      case normalize_route(route) do
+        {:ok, normalized_route} -> {:cont, {:ok, [normalized_route | parsed]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> then(fn
+      {:ok, parsed} -> {:ok, parsed |> Enum.reverse() |> Enum.uniq()}
+      error -> error
+    end)
   end
 
-  def advertisement(routes), do: {:error, {:invalid_routes, routes}}
-
-  @doc false
-  @spec ensure_supported() :: :ok | {:error, term()}
-  def ensure_supported, do: ensure_linux()
+  def normalize_routes(routes), do: {:error, {:invalid_routes, routes}}
 
   @spec forwarding_status() :: {:ok, %{ipv4: boolean(), ipv6: boolean()}} | {:error, term()}
   def forwarding_status do
@@ -52,23 +49,6 @@ defmodule Tailscale.SubnetRouter do
     end
   end
 
-  @spec require_forwarding([family()]) :: :ok | {:error, term()}
-  def require_forwarding(families) do
-    require_forwarding(families, @default_paths)
-  end
-
-  @doc false
-  @spec require_forwarding([family()], paths()) :: :ok | {:error, term()}
-  def require_forwarding(families, paths) do
-    with :ok <- ensure_linux(),
-         {:ok, disabled} <- disabled_families(families, paths) do
-      case disabled do
-        [] -> :ok
-        families -> {:error, {:forwarding_disabled, families}}
-      end
-    end
-  end
-
   @spec enable_forwarding(keyword()) :: :ok | {:error, term()}
   def enable_forwarding(opts) do
     enable_forwarding(opts, @default_paths)
@@ -78,6 +58,7 @@ defmodule Tailscale.SubnetRouter do
   @spec enable_forwarding(keyword(), paths()) :: :ok | {:error, term()}
   def enable_forwarding(opts, paths) when is_list(opts) do
     with :ok <- ensure_linux(),
+         :ok <- validate_options(opts),
          {:ok, families} <- fetch_families(opts),
          {:ok, persist?} <- fetch_persistence(opts),
          :ok <- maybe_persist(families, persist?, paths.sysctl) do
@@ -87,20 +68,7 @@ defmodule Tailscale.SubnetRouter do
 
   def enable_forwarding(opts, _paths), do: {:error, {:invalid_options, opts}}
 
-  defp parse_routes(routes) do
-    Enum.reduce_while(routes, {:ok, []}, fn route, {:ok, parsed} ->
-      case parse_route(route) do
-        {:ok, parsed_route} -> {:cont, {:ok, [parsed_route | parsed]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> then(fn
-      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
-      error -> error
-    end)
-  end
-
-  defp parse_route(route) when is_binary(route) do
+  defp normalize_route(route) when is_binary(route) do
     normalized_route = String.trim(route)
 
     with [address, prefix] <- String.split(normalized_route, "/", parts: 2),
@@ -108,13 +76,13 @@ defmodule Tailscale.SubnetRouter do
          family <- address_family(parsed_address),
          {prefix_length, ""} <- Integer.parse(prefix),
          true <- valid_prefix?(family, prefix_length) do
-      {:ok, {normalized_route, family}}
+      {:ok, canonical_prefix(parsed_address, prefix_length)}
     else
       _reason -> {:error, {:invalid_route, route}}
     end
   end
 
-  defp parse_route(route), do: {:error, {:invalid_route, route}}
+  defp normalize_route(route), do: {:error, {:invalid_route, route}}
 
   defp parse_address(address) do
     case :inet.parse_address(String.to_charlist(address)) do
@@ -129,20 +97,34 @@ defmodule Tailscale.SubnetRouter do
   defp valid_prefix?(:ipv4, prefix), do: prefix in 0..32
   defp valid_prefix?(:ipv6, prefix), do: prefix in 0..128
 
-  defp disabled_families(families, paths) do
-    families
-    |> Enum.uniq()
-    |> Enum.reduce_while({:ok, []}, fn family, {:ok, disabled} ->
-      case read_forwarding(family, Map.fetch!(paths, family)) do
-        {:ok, true} -> {:cont, {:ok, disabled}}
-        {:ok, false} -> {:cont, {:ok, [family | disabled]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> then(fn
-      {:ok, disabled} -> {:ok, Enum.reverse(disabled)}
-      error -> error
-    end)
+  defp canonical_prefix(address, prefix_length) do
+    segments = Tuple.to_list(address)
+    segment_count = tuple_size(address)
+    segment_bits = if segment_count == 4, do: 8, else: 16
+    total_bits = segment_count * segment_bits
+    host_bits = total_bits - prefix_length
+
+    address_integer =
+      Enum.reduce(segments, 0, fn segment, value ->
+        value <<< segment_bits ||| segment
+      end)
+
+    network_integer = (address_integer >>> host_bits) <<< host_bits
+
+    network_address =
+      total_bits
+      |> segment_shifts(segment_bits)
+      |> Enum.map(&(network_integer >>> &1 &&& (1 <<< segment_bits) - 1))
+      |> List.to_tuple()
+      |> :inet.ntoa()
+      |> to_string()
+
+    "#{network_address}/#{prefix_length}"
+  end
+
+  defp segment_shifts(total_bits, segment_bits) do
+    Stream.iterate(total_bits - segment_bits, &(&1 - segment_bits))
+    |> Enum.take(div(total_bits, segment_bits))
   end
 
   defp read_forwarding(family, path) do
@@ -157,6 +139,14 @@ defmodule Tailscale.SubnetRouter do
 
   defp parse_forwarding_value(family, path, value) do
     {:error, {:invalid_forwarding_value, family, path, value}}
+  end
+
+  defp validate_options(opts) do
+    cond do
+      not Keyword.keyword?(opts) -> {:error, {:invalid_options, opts}}
+      Keyword.keys(opts) -- [:families, :persist] != [] -> {:error, {:invalid_options, opts}}
+      true -> :ok
+    end
   end
 
   defp fetch_families(opts) do

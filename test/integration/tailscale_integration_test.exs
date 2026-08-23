@@ -34,6 +34,7 @@ defmodule TailscaleIntegrationTest do
   end
 
   test "uses the installed client to communicate with the connected daemon", %{server: server} do
+    assert :ok = Tailscale.await_ready(server, timeout: 10_000)
     assert {:ok, version} = Tailscale.version(server)
     assert version =~ ~r/^\d+\.\d+\.\d+$/
 
@@ -42,6 +43,19 @@ defmodule TailscaleIntegrationTest do
     assert status["Self"]["Online"] == true
     assert status["TailscaleIPs"] != []
     assert Tailscale.online?(server)
+
+    assert {:ok, %Tailscale.Preferences{advertised_routes: advertised_routes}} =
+             Tailscale.preferences(server)
+
+    assert {:ok,
+            %{
+              advertised: ^advertised_routes,
+              approved: approved_routes,
+              primary: primary_routes
+            }} = Tailscale.route_status(server)
+
+    assert is_list(approved_routes)
+    assert is_list(primary_routes)
 
     assert {:ok, ipv4} = Tailscale.cli(server, "ip", ["--4"])
     assert {:ok, _address} = ipv4 |> String.to_charlist() |> :inet.parse_address()

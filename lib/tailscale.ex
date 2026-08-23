@@ -26,6 +26,9 @@ defmodule Tailscale do
   use GenServer
   require Logger
 
+  alias Tailscale.CommandError
+  alias Tailscale.Preferences
+  alias Tailscale.RouteStatus
   alias Tailscale.SubnetRouter
 
   @default_daemon_path "/usr/sbin/tailscaled"
@@ -34,9 +37,13 @@ defmodule Tailscale do
   @default_socket_path "/run/tailscale/tailscaled.sock"
   @default_timeout 5_000
   @default_tun :kernel
+  @default_readiness_timeout 10_000
+  @default_readiness_interval 100
 
   @type tun :: :kernel | :userspace | String.t()
   @type route :: String.t()
+  @type preference_change :: {:advertise_routes, [route()]}
+  @type readiness_option :: {:timeout, pos_integer()} | {:interval, pos_integer()}
   @type forwarding_family :: :ipv4 | :ipv6
   @type forwarding_status :: %{required(:ipv4) => boolean(), required(:ipv6) => boolean()}
   @type forwarding_option ::
@@ -165,40 +172,89 @@ defmodule Tailscale do
   end
 
   @doc """
-  Advertises Linux subnet routes through Tailscale.
+  Changes explicitly specified Tailscale preferences.
 
-  The routes must be IPv4 or IPv6 CIDRs. Duplicate routes are removed while
-  preserving their original order. This replaces the complete set of routes
-  currently advertised by this node.
-
-  Kernel forwarding must already be enabled for every address family used. A
-  successful result means the routes were configured locally; they can still
-  require approval in the Tailscale admin console or through `autoApprovers`.
+  Unspecified preferences remain unchanged because this API always uses
+  `tailscale set`, never `tailscale up`. Routes are normalized and deduplicated;
+  an empty list withdraws every advertised route.
 
   ## Examples
 
-      Tailscale.advertise_routes(["192.168.1.0/24", "10.0.0.0/24"])
-      Tailscale.advertise_routes(my_server, ["fd00:1234::/64"])
+      Tailscale.set(advertise_routes: ["192.168.10.0/24", "10.20.0.0/16"])
+      Tailscale.set(my_server, advertise_routes: [])
 
   """
-  @spec advertise_routes(GenServer.server(), [route()]) :: :ok | {:error, term()}
-  def advertise_routes(server \\ __MODULE__, routes) do
-    with {:ok, %{argument: argument, families: families}} <-
-           SubnetRouter.advertisement(routes),
-         :ok <- SubnetRouter.require_forwarding(families),
-         {:ok, _output} <- cli(server, "set", [argument]) do
+  @spec set([preference_change()]) :: :ok | {:error, term()}
+  def set(changes), do: set(__MODULE__, changes)
+
+  @spec set(GenServer.server(), [preference_change()]) :: :ok | {:error, term()}
+  def set(server, changes) do
+    with {:ok, arguments} <- Preferences.encode_changes(changes),
+         {:ok, _output} <- cli(server, "set", arguments) do
       :ok
     end
   end
 
   @doc """
-  Withdraws all subnet routes advertised by this node.
+  Reads the preferences currently configured in `tailscaled`.
+
+  This returns a stable Elixir projection over the JSON emitted by
+  `tailscale debug prefs`.
   """
-  @spec withdraw_routes(GenServer.server()) :: :ok | {:error, term()}
-  def withdraw_routes(server \\ __MODULE__) do
-    with :ok <- SubnetRouter.ensure_supported(),
-         {:ok, _output} <- cli(server, "set", ["--advertise-routes="]) do
-      :ok
+  @spec preferences(GenServer.server()) :: {:ok, Preferences.t()} | {:error, term()}
+  def preferences(server \\ __MODULE__) do
+    with {:ok, response} <- cli(server, "debug", ["prefs"]) do
+      Preferences.from_cli(response)
+    end
+  end
+
+  @doc """
+  Returns the subnet routes currently configured for advertisement.
+  """
+  @spec advertised_routes(GenServer.server()) :: {:ok, [route()]} | {:error, term()}
+  def advertised_routes(server \\ __MODULE__) do
+    with {:ok, preferences} <- preferences(server) do
+      {:ok, preferences.advertised_routes}
+    end
+  end
+
+  @doc """
+  Projects the node's advertised, control-plane-approved, and primary routes.
+
+  Approval remains a Tailscale policy or admin-console responsibility.
+  """
+  @spec route_status(GenServer.server()) :: {:ok, RouteStatus.t()} | {:error, term()}
+  def route_status(server \\ __MODULE__) do
+    with {:ok, preferences} <- preferences(server),
+         {:ok, status} <- status(server) do
+      RouteStatus.project(preferences, status)
+    end
+  end
+
+  @doc """
+  Waits until the `tailscaled` socket accepts CLI commands.
+
+  Readiness does not require authentication or an online node. States such as
+  `NeedsLogin` are ready, which makes this suitable before commissioning.
+
+  ## Options
+
+    * `:timeout` - total wait in milliseconds (default: `#{@default_readiness_timeout}`)
+    * `:interval` - delay between attempts in milliseconds (default: `#{@default_readiness_interval}`)
+
+  """
+  @spec await_ready() :: :ok | {:error, term()}
+  def await_ready, do: await_ready(__MODULE__, [])
+
+  @spec await_ready([readiness_option()] | GenServer.server()) :: :ok | {:error, term()}
+  def await_ready(opts) when is_list(opts), do: await_ready(__MODULE__, opts)
+  def await_ready(server), do: await_ready(server, [])
+
+  @spec await_ready(GenServer.server(), [readiness_option()]) :: :ok | {:error, term()}
+  def await_ready(server, opts) do
+    with {:ok, timeout, interval} <- readiness_options(opts) do
+      deadline = System.monotonic_time(:millisecond) + timeout
+      await_ready_until(server, deadline, interval, nil)
     end
   end
 
@@ -345,6 +401,11 @@ defmodule Tailscale do
     {:reply, result, state}
   end
 
+  def handle_call({:readiness, timeout}, _from, state) do
+    result = exec_command(state, "status", ["--json"], timeout)
+    {:reply, result, state}
+  end
+
   @impl true
   def terminate(reason, %State{daemon_pid: daemon_pid}) do
     Logger.warning("Tailscale GenServer terminating. Reason: #{inspect(reason)}")
@@ -358,6 +419,57 @@ defmodule Tailscale do
 
   # Private functions
 
+  defp readiness_options(opts) when is_list(opts) do
+    if Keyword.keyword?(opts) and Keyword.keys(opts) -- [:timeout, :interval] == [] do
+      timeout = Keyword.get(opts, :timeout, @default_readiness_timeout)
+      interval = Keyword.get(opts, :interval, @default_readiness_interval)
+
+      if is_integer(timeout) and timeout > 0 and is_integer(interval) and interval > 0 do
+        {:ok, timeout, interval}
+      else
+        {:error, {:invalid_readiness_options, opts}}
+      end
+    else
+      {:error, {:invalid_readiness_options, opts}}
+    end
+  end
+
+  defp readiness_options(opts), do: {:error, {:invalid_readiness_options, opts}}
+
+  defp await_ready_until(server, deadline, interval, last_error) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, {:readiness_timeout, last_error}}
+    else
+      case readiness_attempt(server, remaining) do
+        {:ok, _response} ->
+          :ok
+
+        {:error, reason} ->
+          sleep_until_next_attempt(deadline, interval)
+          await_ready_until(server, deadline, interval, readiness_error(reason, last_error))
+      end
+    end
+  end
+
+  defp readiness_attempt(server, timeout) do
+    GenServer.call(server, {:readiness, timeout}, timeout)
+  catch
+    :exit, reason -> {:error, {:server_unavailable, reason}}
+  end
+
+  defp readiness_error({:server_unavailable, _reason}, previous_error)
+       when not is_nil(previous_error),
+       do: previous_error
+
+  defp readiness_error(error, _previous_error), do: error
+
+  defp sleep_until_next_attempt(deadline, interval) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+    Process.sleep(min(interval, remaining))
+  end
+
   defp start_daemon(state) do
     daemon_args =
       [
@@ -369,13 +481,17 @@ defmodule Tailscale do
   end
 
   defp exec_command(state, command, args) when is_list(args) do
+    exec_command(state, command, args, state.timeout)
+  end
+
+  defp exec_command(state, command, args, timeout) when is_list(args) do
     # Add --socket flag to all commands.
     # It needs to be the first argument for tailscale to work correctly.
     args_with_socket = ["--socket=#{state.socket_path}", command] ++ args
 
     muontrap_opts = [
       stderr_to_stdout: true,
-      timeout: state.timeout
+      timeout: timeout
     ]
 
     case MuonTrap.cmd(state.cli_path, args_with_socket, muontrap_opts) do
@@ -388,10 +504,22 @@ defmodule Tailscale do
         end
 
       {output, :timeout} ->
-        {:error, {:timeout, String.trim(output)}}
+        {:error,
+         %CommandError{
+           command: command,
+           exit_code: nil,
+           output: String.trim(output),
+           reason: :timeout
+         }}
 
       {output, exit_code} ->
-        {:error, {exit_code, String.trim(output)}}
+        {:error,
+         %CommandError{
+           command: command,
+           exit_code: exit_code,
+           output: String.trim(output),
+           reason: :exit_status
+         }}
     end
   end
 

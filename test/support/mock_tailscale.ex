@@ -44,6 +44,27 @@ defmodule MockTailscale do
   end
 
   @doc """
+  Configures the approved and primary routes returned by mock status JSON.
+  """
+  @spec configure_route_status(Path.t(), keyword()) :: :ok
+  def configure_route_status(test_dir, opts) do
+    approved = Keyword.get(opts, :approved, [])
+    primary = Keyword.get(opts, :primary, [])
+
+    File.write!(Path.join(test_dir, "approved-routes"), Enum.join(approved, ","))
+    File.write!(Path.join(test_dir, "primary-routes"), Enum.join(primary, ","))
+    :ok
+  end
+
+  @doc """
+  Makes the next `count` status commands fail as if the daemon were not ready.
+  """
+  @spec configure_status_failures(Path.t(), non_neg_integer()) :: :ok
+  def configure_status_failures(test_dir, count) do
+    File.write!(Path.join(test_dir, "status-failures"), Integer.to_string(count))
+  end
+
+  @doc """
   Cleans up mock binaries and temporary directory.
   """
   @spec cleanup_mocks(Path.t()) :: :ok
@@ -71,7 +92,25 @@ defmodule MockTailscale do
       fi
     done
     set -- "${args[@]}"
-    printf '%s\n' "$@" > "$(dirname "$0")/cli-args"
+    MOCK_DIR="$(dirname "$0")"
+    printf '%s\n' "$@" > "$MOCK_DIR/cli-args"
+
+    json_array() {
+      printf '%s\n' "$1" | awk -F, '{
+        printf "["
+        for (i = 1; i <= NF && $i != ""; i++) {
+          if (i > 1) printf ","
+          printf "\\\"%s\\\"", $i
+        }
+        printf "]"
+      }'
+    }
+
+    file_contents() {
+      if [ -f "$1" ]; then
+        cat "$1"
+      fi
+    }
 
     case "$1" in
       --version)
@@ -88,8 +127,26 @@ defmodule MockTailscale do
         ;;
 
       status)
+        failures="$(file_contents "$MOCK_DIR/status-failures")"
+        if [ -n "$failures" ] && [ "$failures" -gt 0 ]; then
+          printf '%s' "$((failures - 1))" > "$MOCK_DIR/status-failures"
+          echo "failed to connect to local tailscaled"
+          exit 1
+        fi
+
         if [[ "$*" == *"--json"* ]]; then
-          echo '{"Self":{"Online":true,"HostName":"mock-host","TailscaleIPs":["100.64.0.1"]},"Peer":{}}'
+          approved="$(file_contents "$MOCK_DIR/approved-routes")"
+          primary="$(file_contents "$MOCK_DIR/primary-routes")"
+          allowed="100.64.0.1/32"
+          if [ -n "$approved" ]; then
+            allowed="$allowed,$approved"
+          fi
+
+          printf '%s' '{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"Online":true,"HostName":"mock-host","TailscaleIPs":["100.64.0.1"],"AllowedIPs":'
+          json_array "$allowed"
+          printf '%s' ',"PrimaryRoutes":'
+          json_array "$primary"
+          echo '},"Peer":{}}'
         else
           echo "# Health check:"
           echo "#     - logged in, available"
@@ -127,8 +184,39 @@ defmodule MockTailscale do
         ;;
 
       set)
-        echo "Success."
+        if [ -f "$MOCK_DIR/set-error" ]; then
+          echo "failed to update preferences"
+          exit 1
+        fi
+
+        for arg in "$@"; do
+          case "$arg" in
+            --advertise-routes=*)
+              printf '%s' "${arg#*=}" > "$MOCK_DIR/advertised-routes"
+              ;;
+          esac
+        done
         exit 0
+        ;;
+
+      debug)
+        case "$2" in
+          prefs)
+            routes="$(file_contents "$MOCK_DIR/advertised-routes")"
+            if [ -n "$routes" ]; then
+              printf '%s' '{"AdvertiseRoutes":'
+              json_array "$routes"
+              echo '}'
+            else
+              echo '{"AdvertiseRoutes":null}'
+            fi
+            exit 0
+            ;;
+          *)
+            echo "unknown debug command: $2"
+            exit 1
+            ;;
+        esac
         ;;
 
       switch)
