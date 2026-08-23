@@ -1,350 +1,251 @@
 defmodule MockTailscale do
-  @moduledoc """
-  Mock implementation of tailscale and tailscaled binaries for testing.
+  @moduledoc false
 
-  This module creates simple shell scripts that mimic the behavior of
-  the real tailscale CLI without requiring actual installation.
-  """
-
-  @doc """
-  Creates mock binaries in a temporary directory.
-
-  Returns a map with:
-  - `:cli_path` - Path to mock tailscale CLI
-  - `:daemon_path` - Path to mock tailscaled daemon
-  - `:test_dir` - Temporary directory containing the mocks
-  """
-  @spec create_mocks() :: %{
-          cli_path: Path.t(),
-          daemon_path: Path.t(),
-          test_dir: Path.t()
-        }
+  @spec create_mocks() :: %{cli_path: Path.t(), daemon_path: Path.t(), test_dir: Path.t()}
   def create_mocks do
     test_dir =
-      Path.join(System.tmp_dir!(), "mock_tailscale_#{:erlang.unique_integer([:positive])}")
+      Path.join(System.tmp_dir!(), "mock_tailscale_#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(test_dir)
 
     cli_path = Path.join(test_dir, "tailscale")
     daemon_path = Path.join(test_dir, "tailscaled")
-
-    # Create mock tailscale CLI
     File.write!(cli_path, mock_cli_script())
-    File.chmod!(cli_path, 0o755)
-
-    # Create mock tailscaled daemon
     File.write!(daemon_path, mock_daemon_script())
+    File.chmod!(cli_path, 0o755)
     File.chmod!(daemon_path, 0o755)
 
-    %{
-      cli_path: cli_path,
-      daemon_path: daemon_path,
-      test_dir: test_dir
-    }
+    %{cli_path: cli_path, daemon_path: daemon_path, test_dir: test_dir}
   end
 
-  @doc """
-  Configures the approved and primary routes returned by mock status JSON.
-  """
-  @spec configure_route_status(Path.t(), keyword()) :: :ok
-  def configure_route_status(test_dir, opts) do
-    approved = Keyword.get(opts, :approved, [])
-    primary = Keyword.get(opts, :primary, [])
-
-    File.write!(Path.join(test_dir, "approved-routes"), Enum.join(approved, ","))
-    File.write!(Path.join(test_dir, "primary-routes"), Enum.join(primary, ","))
-    :ok
-  end
-
-  @doc """
-  Makes the next `count` status commands fail as if the daemon were not ready.
-  """
-  @spec configure_status_failures(Path.t(), non_neg_integer()) :: :ok
-  def configure_status_failures(test_dir, count) do
-    File.write!(Path.join(test_dir, "status-failures"), Integer.to_string(count))
-  end
-
-  @doc """
-  Cleans up mock binaries and temporary directory.
-  """
   @spec cleanup_mocks(Path.t()) :: :ok
   def cleanup_mocks(test_dir) do
     File.rm_rf!(test_dir)
     :ok
   end
 
-  # Private functions
+  @spec configure_route_status(Path.t(), keyword()) :: :ok
+  def configure_route_status(test_dir, opts) do
+    write_csv(test_dir, "approved-routes", Keyword.get(opts, :approved, []))
+    write_csv(test_dir, "primary-routes", Keyword.get(opts, :primary, []))
+  end
+
+  @spec configure_status(Path.t(), keyword()) :: :ok
+  def configure_status(test_dir, opts) do
+    Enum.each(opts, fn {key, value} ->
+      filename = key |> Atom.to_string() |> String.replace("_", "-")
+      File.write!(Path.join(test_dir, filename), to_string(value))
+    end)
+
+    :ok
+  end
+
+  @spec configure_status_failures(Path.t(), non_neg_integer()) :: :ok
+  def configure_status_failures(test_dir, count) do
+    File.write!(Path.join(test_dir, "status-failures"), Integer.to_string(count))
+  end
+
+  @spec configure_delay(Path.t(), String.t(), number()) :: :ok
+  def configure_delay(test_dir, command, seconds) do
+    File.write!(Path.join(test_dir, "delay-#{command}"), to_string(seconds))
+  end
+
+  @spec configure_daemon_exits(Path.t(), non_neg_integer()) :: :ok
+  def configure_daemon_exits(test_dir, count) do
+    File.write!(Path.join(test_dir, "daemon-exit-count"), Integer.to_string(count))
+  end
+
+  @spec command_log(Path.t()) :: [String.t()]
+  def command_log(test_dir), do: read_lines(Path.join(test_dir, "command-log"))
+
+  @spec mutation_log(Path.t()) :: [String.t()]
+  def mutation_log(test_dir), do: read_lines(Path.join(test_dir, "mutation-log"))
+
+  defp write_csv(test_dir, filename, values) do
+    File.write!(Path.join(test_dir, filename), Enum.join(values, ","))
+    :ok
+  end
+
+  defp read_lines(path) do
+    case File.read(path) do
+      {:ok, contents} -> String.split(contents, "\n", trim: true)
+      {:error, :enoent} -> []
+    end
+  end
 
   defp mock_cli_script do
-    """
+    ~S"""
     #!/bin/bash
-    # Mock tailscale CLI for testing
+    trap 'sleep 0.005' EXIT
 
-    # Give MuonTrap time to acknowledge captured output before this short-lived
-    # process closes its pipes.
-    trap 'sleep 0.01' EXIT
-
-    # Strip out --socket flag if present
+    MOCK_DIR="$(dirname "$0")"
+    SOCKET=""
     args=()
     for arg in "$@"; do
-      if [[ "$arg" != --socket=* ]]; then
-        args+=("$arg")
-      fi
+      case "$arg" in
+        --socket=*) SOCKET="${arg#*=}" ;;
+        *) args+=("$arg") ;;
+      esac
     done
     set -- "${args[@]}"
-    MOCK_DIR="$(dirname "$0")"
+    command="$1"
+
     printf '%s\n' "$@" > "$MOCK_DIR/cli-args"
+    printf 'start %s %s\n' "$command" "$(date +%s%N)" >> "$MOCK_DIR/command-log"
+
+    finish() {
+      printf 'finish %s %s\n' "$command" "$(date +%s%N)" >> "$MOCK_DIR/command-log"
+    }
+    trap 'finish; sleep 0.005' EXIT
+
+    contents() {
+      [ -f "$1" ] && cat "$1"
+    }
 
     json_array() {
       printf '%s\n' "$1" | awk -F, '{
         printf "["
         for (i = 1; i <= NF && $i != ""; i++) {
           if (i > 1) printf ","
-          printf "\\\"%s\\\"", $i
+          printf "\"%s\"", $i
         }
         printf "]"
       }'
     }
 
-    file_contents() {
-      if [ -f "$1" ]; then
-        cat "$1"
-      fi
-    }
+    delay="$(contents "$MOCK_DIR/delay-$command")"
+    [ -n "$delay" ] && sleep "$delay"
 
-    case "$1" in
+    case "$command" in
+      version|--version) ;;
+      *)
+        if [ -z "$SOCKET" ] || [ ! -e "$SOCKET" ]; then
+          echo "failed to connect to local tailscaled"
+          exit 1
+        fi
+        ;;
+    esac
+
+    case "$command" in
       --version)
         echo "1.88.3"
-        echo "  tailscale commit: 9961c097b1781891e3c6b96e5e1194355ff06a6d-dirty"
-        echo "  long version: 1.88.3-t9961c097b"
-        echo "  go version: go1.25.1"
-        exit 0
         ;;
 
       version)
-        echo "1.88.3"
-        exit 0
+        if [[ "$*" == *"--json"* ]]; then
+          echo '{"majorMinorPatch":"1.88.3"}'
+        else
+          echo "1.88.3"
+        fi
         ;;
 
       status)
-        failures="$(file_contents "$MOCK_DIR/status-failures")"
+        failures="$(contents "$MOCK_DIR/status-failures")"
         if [ -n "$failures" ] && [ "$failures" -gt 0 ]; then
           printf '%s' "$((failures - 1))" > "$MOCK_DIR/status-failures"
           echo "failed to connect to local tailscaled"
           exit 1
         fi
 
-        if [[ "$*" == *"--json"* ]]; then
-          approved="$(file_contents "$MOCK_DIR/approved-routes")"
-          primary="$(file_contents "$MOCK_DIR/primary-routes")"
-          allowed="100.64.0.1/32"
-          if [ -n "$approved" ]; then
-            allowed="$allowed,$approved"
-          fi
+        backend="$(contents "$MOCK_DIR/backend-state")"
+        online="$(contents "$MOCK_DIR/online")"
+        have_key="$(contents "$MOCK_DIR/have-node-key")"
+        hostname="$(contents "$MOCK_DIR/hostname")"
+        approved="$(contents "$MOCK_DIR/approved-routes")"
+        primary="$(contents "$MOCK_DIR/primary-routes")"
+        [ -z "$backend" ] && backend="Running"
+        [ -z "$online" ] && online="true"
+        [ -z "$have_key" ] && have_key="true"
+        [ -z "$hostname" ] && hostname="mock-host"
+        allowed="100.64.0.1/32"
+        [ -n "$approved" ] && allowed="$allowed,$approved"
 
-          printf '%s' '{"BackendState":"Running","TailscaleIPs":["100.64.0.1"],"Self":{"Online":true,"HostName":"mock-host","TailscaleIPs":["100.64.0.1"],"AllowedIPs":'
-          json_array "$allowed"
-          printf '%s' ',"PrimaryRoutes":'
-          json_array "$primary"
-          echo '},"Peer":{}}'
+        printf '{"BackendState":"%s","HaveNodeKey":%s,"TailscaleIPs":["100.64.0.1"],"Self":{"Online":%s,"HostName":"%s","TailscaleIPs":["100.64.0.1"],"AllowedIPs":' "$backend" "$have_key" "$online" "$hostname"
+        json_array "$allowed"
+        printf ',"PrimaryRoutes":'
+        json_array "$primary"
+        echo '},"Peer":{}}'
+        ;;
+
+      login)
+        printf 'login\n' >> "$MOCK_DIR/mutation-log"
+        auth_arg=""
+        for arg in "$@"; do
+          case "$arg" in --auth-key=*) auth_arg="${arg#*=}" ;; esac
+        done
+        case "$auth_arg" in
+          file:*)
+            auth_file="${auth_arg#file:}"
+            [ -r "$auth_file" ] || { echo "auth key file unavailable"; exit 1; }
+            printf '%s' "$auth_arg" > "$MOCK_DIR/login-auth-argument"
+            if [ -f "$MOCK_DIR/echo-auth-error" ]; then
+              cat "$auth_file"
+              exit 1
+            fi
+            ;;
+          *) echo "auth key must use file reference"; exit 1 ;;
+        esac
+        ;;
+
+      set)
+        printf 'set\n' >> "$MOCK_DIR/mutation-log"
+        [ -f "$MOCK_DIR/set-error" ] && { echo "failed to update preferences"; exit 1; }
+        for arg in "$@"; do
+          case "$arg" in
+            --advertise-routes=*) printf '%s' "${arg#*=}" > "$MOCK_DIR/advertised-routes" ;;
+            --hostname=*) printf '%s' "${arg#*=}" > "$MOCK_DIR/preference-hostname" ;;
+            --accept-dns) printf 'true' > "$MOCK_DIR/accept-dns" ;;
+            --accept-dns=false) printf 'false' > "$MOCK_DIR/accept-dns" ;;
+            --ssh) printf 'true' > "$MOCK_DIR/ssh" ;;
+            --ssh=false) printf 'false' > "$MOCK_DIR/ssh" ;;
+          esac
+        done
+        ;;
+
+      debug)
+        if [ "$2" != "prefs" ]; then echo "unknown debug command"; exit 1; fi
+        routes="$(contents "$MOCK_DIR/advertised-routes")"
+        hostname="$(contents "$MOCK_DIR/preference-hostname")"
+        dns="$(contents "$MOCK_DIR/accept-dns")"
+        ssh="$(contents "$MOCK_DIR/ssh")"
+        [ -z "$dns" ] && dns="true"
+        [ -z "$ssh" ] && ssh="false"
+        printf '{"Hostname":"%s","CorpDNS":%s,"RunSSH":%s,"AdvertiseRoutes":' "$hostname" "$dns" "$ssh"
+        if [ -n "$routes" ]; then json_array "$routes"; else printf 'null'; fi
+        echo '}'
+        ;;
+
+      switch)
+        if [ "$2" = "--list" ]; then
+          profiles="$(contents "$MOCK_DIR/profiles-json")"
+          if [ -n "$profiles" ]; then
+            printf '%s\n' "$profiles"
+          else
+            echo '[{"id":"profile-1","nickname":"main","tailnet":"example.ts.net","account":"user@example.com","selected":true}]'
+          fi
+        elif [ "$2" = "remove" ]; then
+          printf 'switch remove %s\n' "$3" >> "$MOCK_DIR/mutation-log"
         else
-          echo "# Health check:"
-          echo "#     - logged in, available"
-          echo ""
-          echo "mock-host  100.64.0.1"
+          printf 'switch %s\n' "$2" >> "$MOCK_DIR/mutation-log"
         fi
-        exit 0
         ;;
 
       ip)
         echo "100.64.0.1"
         echo "fd7a:115c:a1e0::1"
-        exit 0
         ;;
 
-      up)
+      up|down|logout|configure)
+        printf '%s\n' "$command" >> "$MOCK_DIR/mutation-log"
         echo "Success."
-        exit 0
-        ;;
-
-      down)
-        echo "Success."
-        exit 0
-        ;;
-
-      login)
-        echo "To authenticate, visit:"
-        echo "https://login.tailscale.com/a/mock-auth-url"
-        exit 0
-        ;;
-
-      logout)
-        echo "Success."
-        exit 0
-        ;;
-
-      set)
-        if [ -f "$MOCK_DIR/set-error" ]; then
-          echo "failed to update preferences"
-          exit 1
-        fi
-
-        for arg in "$@"; do
-          case "$arg" in
-            --advertise-routes=*)
-              printf '%s' "${arg#*=}" > "$MOCK_DIR/advertised-routes"
-              ;;
-          esac
-        done
-        exit 0
-        ;;
-
-      debug)
-        case "$2" in
-          prefs)
-            routes="$(file_contents "$MOCK_DIR/advertised-routes")"
-            if [ -n "$routes" ]; then
-              printf '%s' '{"AdvertiseRoutes":'
-              json_array "$routes"
-              echo '}'
-            else
-              echo '{"AdvertiseRoutes":null}'
-            fi
-            exit 0
-            ;;
-          *)
-            echo "unknown debug command: $2"
-            exit 1
-            ;;
-        esac
-        ;;
-
-      switch)
-        echo "Switched to account mock@example.com"
-        exit 0
-        ;;
-
-      netcheck)
-        echo "Report:"
-        echo "  * UDP: true"
-        echo "  * IPv4: yes, 203.0.113.1:12345"
-        echo "  * IPv6: no"
-        exit 0
-        ;;
-
-      metrics)
-        echo "# HELP tailscale_up 1 if the Tailscale interface is up, 0 if down"
-        echo "# TYPE tailscale_up gauge"
-        echo "tailscale_up 0"
-        exit 0
-        ;;
-
-      ping)
-        echo "pong from mock-node (100.64.0.2) via DERP(mock) in 25ms"
-        exit 0
-        ;;
-
-      bugreport)
-        echo "BUG-12345-MOCK"
-        exit 0
-        ;;
-
-      licenses)
-        echo "Tailscale uses the following open source software:"
-        echo "- Go standard library (BSD-3-Clause)"
-        exit 0
-        ;;
-
-      dns)
-        echo "DNS configuration:"
-        echo "  Resolver: direct"
-        exit 0
-        ;;
-
-      exit-node)
-        if [[ "$*" == *"--json"* ]]; then
-          echo '[]'
-        else
-          echo "# Available exit nodes:"
-          echo "# (none)"
-        fi
-        exit 0
         ;;
 
       whois)
-        if [[ "$*" == *"--json"* ]]; then
-          echo '{"Node":{"Name":"mock-node","ID":"12345"},"UserProfile":{"LoginName":"user@example.com"}}'
-        else
-          echo "mock-node"
-          echo "  User: user@example.com"
-        fi
-        exit 0
-        ;;
-
-      file)
-        echo "Success."
-        exit 0
-        ;;
-
-      cert)
-        echo "Success. Certificate written."
-        exit 0
-        ;;
-
-      serve)
-        echo "Available services: (none)"
-        exit 0
-        ;;
-
-      funnel)
-        echo "Funnel status"
-        exit 0
-        ;;
-
-      ssh)
-        echo "SSH connection would be initiated here"
-        exit 1
-        ;;
-
-      nc)
-        echo "nc: connection refused"
-        exit 1
-        ;;
-
-      lock)
-        echo "Tailnet lock status: disabled"
-        exit 0
-        ;;
-
-      update)
-        echo "Already up to date."
-        exit 0
-        ;;
-
-      configure)
-        echo "Configuration applied."
-        exit 0
-        ;;
-
-      syspolicy)
-        echo "No system policies active."
-        exit 0
-        ;;
-
-      drive)
-        echo "No drives shared."
-        exit 0
-        ;;
-
-      web)
-        echo "Starting web interface on localhost:8088"
-        # Don't actually start a server in tests
-        exit 1
+        echo '{"Node":{"Name":"mock-node","ID":"12345"}}'
         ;;
 
       *)
-        echo "unknown command: $1"
-        echo "Run 'tailscale --help' for usage."
+        echo "unknown command: $command"
         exit 1
         ;;
     esac
@@ -352,28 +253,33 @@ defmodule MockTailscale do
   end
 
   defp mock_daemon_script do
-    """
+    ~S"""
     #!/bin/bash
-    # Mock tailscaled daemon for testing
-
-    # Parse arguments
+    MOCK_DIR="$(dirname "$0")"
     STATEDIR=""
+    SOCKET=""
+
     for arg in "$@"; do
       case "$arg" in
-        --statedir=*)
-          STATEDIR="${arg#*=}"
-          ;;
+        --statedir=*) STATEDIR="${arg#*=}" ;;
+        --socket=*) SOCKET="${arg#*=}" ;;
       esac
     done
 
-    # Create state directory and record arguments if specified
-    if [ -n "$STATEDIR" ]; then
-      mkdir -p "$STATEDIR"
-      printf '%s\n' "$@" > "$STATEDIR/daemon-args"
+    starts="$(cat "$MOCK_DIR/daemon-start-count" 2>/dev/null)"
+    [ -z "$starts" ] && starts=0
+    printf '%s' "$((starts + 1))" > "$MOCK_DIR/daemon-start-count"
+
+    exits="$(cat "$MOCK_DIR/daemon-exit-count" 2>/dev/null)"
+    if [ -n "$exits" ] && [ "$exits" -gt 0 ]; then
+      printf '%s' "$((exits - 1))" > "$MOCK_DIR/daemon-exit-count"
+      exit 42
     fi
 
-    # Mock daemon just sleeps
-    # In real tests, this will be supervised by MuonTrap
+    mkdir -p "$STATEDIR" "$(dirname "$SOCKET")"
+    printf '%s\n' "$@" > "$STATEDIR/daemon-args"
+    touch "$SOCKET"
+    trap 'rm -f "$SOCKET"; exit 0' TERM INT EXIT
     sleep infinity
     """
   end

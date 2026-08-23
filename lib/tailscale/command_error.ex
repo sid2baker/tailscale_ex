@@ -6,7 +6,7 @@ defmodule Tailscale.CommandError do
   contain credentials.
   """
 
-  @type reason :: :exit_status | :timeout
+  @type reason :: :exit_status | :timeout | :task_exit
 
   @type t :: %__MODULE__{
           command: String.t(),
@@ -21,6 +21,10 @@ defmodule Tailscale.CommandError do
   @impl true
   def message(%__MODULE__{command: command, reason: :timeout, output: output}) do
     append_output("tailscale #{command} timed out", output)
+  end
+
+  def message(%__MODULE__{command: command, reason: :task_exit, output: output}) do
+    append_output("tailscale #{command} command task exited", output)
   end
 
   def message(%__MODULE__{

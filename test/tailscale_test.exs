@@ -1,598 +1,683 @@
 defmodule TailscaleTest do
   use ExUnit.Case, async: false
-  doctest Tailscale
+
+  import ExUnit.CaptureLog
+
+  alias Tailscale.CommandError
+  alias Tailscale.DaemonManager
+  alias Tailscale.Health
+  alias Tailscale.Naming
+  alias Tailscale.Preferences
+  alias Tailscale.Profile
+  alias Tailscale.Status
+
+  def telemetry_handler(event, measurements, metadata, recipient) do
+    send(recipient, {:telemetry, event, measurements, metadata})
+  end
 
   setup do
-    %{cli_path: cli_path, daemon_path: daemon_path, test_dir: mock_dir} =
-      MockTailscale.create_mocks()
-
-    state_dir =
-      Path.join(System.tmp_dir!(), "tailscale_state_#{:erlang.unique_integer([:positive])}")
-
-    File.mkdir_p!(state_dir)
-
+    mocks = MockTailscale.create_mocks()
+    unique = System.unique_integer([:positive])
+    state_dir = Path.join(System.tmp_dir!(), "tailscale_state_#{unique}")
+    runtime_dir = Path.join(System.tmp_dir!(), "tailscale_runtime_#{unique}")
     socket_path = Path.join(state_dir, "tailscaled.sock")
+    name = :"tailscale_test_#{unique}"
 
     opts = [
-      name: :"test_tailscale_#{:erlang.unique_integer([:positive])}",
-      daemon_path: daemon_path,
-      cli_path: cli_path,
+      name: name,
+      daemon_path: mocks.daemon_path,
+      cli_path: mocks.cli_path,
       tailscale_dir: state_dir,
-      socket_path: socket_path
+      socket_path: socket_path,
+      runtime_dir: runtime_dir,
+      command_timeout: 1_000,
+      status_interval: 10_000,
+      daemon_log_level: false,
+      daemon_restart_min: 10,
+      daemon_restart_max: 50,
+      daemon_restart_stable: 100,
+      daemon_restart_jitter: 0
     ]
 
     on_exit(fn ->
-      MockTailscale.cleanup_mocks(mock_dir)
+      MockTailscale.cleanup_mocks(mocks.test_dir)
       File.rm_rf!(state_dir)
+      File.rm_rf!(runtime_dir)
     end)
 
-    %{opts: opts, state_dir: state_dir, mock_dir: mock_dir}
-  end
-
-  # Helper functions
-
-  defp start_and_wait(opts) do
-    {:ok, pid} = Tailscale.start_link(opts)
-    wait_for_daemon(pid)
-    pid
-  end
-
-  defp wait_for_daemon(pid, attempts \\ 50) do
-    case Tailscale.daemon_pid(pid) do
-      {:ok, daemon_pid} when is_pid(daemon_pid) ->
-        :ok
-
-      _ when attempts > 0 ->
-        Process.sleep(10)
-        wait_for_daemon(pid, attempts - 1)
-
-      _ ->
-        raise "Daemon failed to start within timeout"
-    end
-  end
-
-  defp wait_for_daemon_args(state_dir, attempts \\ 50) do
-    case File.read(Path.join(state_dir, "daemon-args")) do
-      {:ok, args} ->
-        args |> String.trim() |> String.split("\n")
-
-      {:error, _reason} when attempts > 0 ->
-        Process.sleep(10)
-        wait_for_daemon_args(state_dir, attempts - 1)
-
-      {:error, reason} ->
-        raise "Failed to read daemon arguments: #{inspect(reason)}"
-    end
-  end
-
-  defp cli_args(mock_dir) do
-    mock_dir
-    |> Path.join("cli-args")
-    |> File.read!()
-    |> String.split("\n", trim: true)
-  end
-
-  describe "start_link/1" do
-    test "uses kernel TUN mode by default", %{opts: opts, state_dir: state_dir} do
-      pid = start_and_wait(opts)
-      daemon_args = wait_for_daemon_args(state_dir)
-
-      assert Process.alive?(pid)
-      refute Enum.any?(daemon_args, &String.starts_with?(&1, "--tun="))
-
-      GenServer.stop(pid)
-    end
-
-    test "supports userspace networking mode", %{opts: opts, state_dir: state_dir} do
-      pid = opts |> Keyword.put(:tun, :userspace) |> start_and_wait()
-
-      assert "--tun=userspace-networking" in wait_for_daemon_args(state_dir)
-
-      GenServer.stop(pid)
-    end
-
-    test "supports a custom TUN interface", %{opts: opts, state_dir: state_dir} do
-      pid = opts |> Keyword.put(:tun, "ts-nerves0") |> start_and_wait()
-
-      assert "--tun=ts-nerves0" in wait_for_daemon_args(state_dir)
-
-      GenServer.stop(pid)
-    end
-
-    test "rejects an invalid TUN mode", %{opts: opts} do
-      assert {:error, message} = opts |> Keyword.put(:tun, nil) |> Tailscale.start_link()
-      assert message =~ ":tun must be"
-    end
-
-    test "starts with custom name", %{opts: opts} do
-      opts = Keyword.put(opts, :name, :custom_tailscale)
-      pid = start_and_wait(opts)
-      assert Process.whereis(:custom_tailscale) == pid
-      GenServer.stop(pid)
-    end
-
-    test "starts with custom timeout", %{opts: opts} do
-      opts = Keyword.put(opts, :timeout, 10_000)
-      pid = start_and_wait(opts)
-      assert Process.alive?(pid)
-      GenServer.stop(pid)
-    end
-
-    test "uses an existing daemon when daemon management is disabled", %{opts: opts} do
-      opts =
-        opts
-        |> Keyword.put(:start_daemon, false)
-        |> Keyword.put(:daemon_path, "/nonexistent/tailscaled")
-
-      assert {:ok, pid} = Tailscale.start_link(opts)
-      assert {:ok, "1.88.3"} = Tailscale.version(pid)
-      assert {:error, :not_started} = Tailscale.daemon_pid(pid)
-      assert Tailscale.online?(pid)
-      assert {:ok, %{"Self" => %{"Online" => true}}} = Tailscale.status(pid)
-      assert {:ok, "100.64.0.1\nfd7a:115c:a1e0::1"} = Tailscale.cli(pid, "ip", [])
-
-      GenServer.stop(pid)
-    end
-
-    test "returns validation error when daemon binary does not exist", %{opts: opts} do
-      opts = Keyword.put(opts, :daemon_path, "/nonexistent/tailscaled")
-      assert {:error, message} = Tailscale.start_link(opts)
-      assert message =~ "not found"
-    end
-
-    test "returns validation error when cli binary does not exist", %{opts: opts} do
-      opts = Keyword.put(opts, :cli_path, "/nonexistent/tailscale")
-      assert {:error, message} = Tailscale.start_link(opts)
-      assert message =~ "not found"
-    end
-
-    test "returns validation error when daemon path is not executable", %{
+    Map.merge(mocks, %{
+      name: name,
       opts: opts,
+      runtime_dir: runtime_dir,
+      socket_path: socket_path,
       state_dir: state_dir
-    } do
-      non_executable = Path.join(state_dir, "not_executable")
-      File.write!(non_executable, "#!/bin/bash\necho test")
-      File.chmod!(non_executable, 0o644)
+    })
+  end
 
-      opts = Keyword.put(opts, :daemon_path, non_executable)
-      assert {:error, message} = Tailscale.start_link(opts)
-      assert message =~ "not executable"
+  describe "supervision and lifecycle" do
+    test "starts an internally supervised daemon and client", context do
+      root = start_instance(context)
+
+      assert Process.alive?(root)
+      assert Process.whereis(context.name)
+
+      assert {:ok, %Health{client: :running, daemon: :running, socket: :ready}} =
+               Tailscale.health(context.name)
+
+      assert {:ok, pid} = daemon_pid(context)
+      assert Process.alive?(pid)
     end
 
-    test "returns validation error when cli path is not executable", %{
-      opts: opts,
-      state_dir: state_dir
-    } do
-      non_executable = Path.join(state_dir, "not_executable_cli")
-      File.write!(non_executable, "#!/bin/bash\necho test")
-      File.chmod!(non_executable, 0o644)
+    test "restarts tailscaled without restarting the public server", context do
+      _root = start_instance(context)
+      server = Process.whereis(context.name)
+      {:ok, daemon} = daemon_pid(context)
 
-      opts = Keyword.put(opts, :cli_path, non_executable)
-      assert {:error, message} = Tailscale.start_link(opts)
-      assert message =~ "not executable"
+      Process.exit(daemon, :kill)
+
+      assert_eventually(fn ->
+        match?({:ok, %Health{daemon: :restarting}}, Tailscale.health(context.name))
+      end)
+
+      assert :ok = Tailscale.await_ready(context.name, timeout: 2_000)
+      assert Process.whereis(context.name) == server
+      assert {:ok, replacement} = daemon_pid(context)
+      assert replacement != daemon
+    end
+
+    test "bounded restart loops do not kill Tailscale.Server", context do
+      :ok = MockTailscale.configure_daemon_exits(context.test_dir, 3)
+      _root = start_instance(context, await?: false)
+      server = Process.whereis(context.name)
+
+      assert :ok = Tailscale.await_ready(context.name, timeout: 3_000)
+      assert Process.whereis(context.name) == server
+      assert File.read!(Path.join(context.test_dir, "daemon-start-count")) == "4"
+    end
+
+    test "calls remain tuple-safe while the internal server restarts", context do
+      _root = start_instance(context)
+      server = Process.whereis(context.name)
+      Process.exit(server, :kill)
+
+      results = for _index <- 1..20, do: Tailscale.status(context.name)
+      assert Enum.all?(results, fn {tag, _value} -> tag in [:ok, :error] end)
+      assert_eventually(fn -> is_pid(Process.whereis(context.name)) end)
+      assert :ok = Tailscale.await_ready(context.name, timeout: 2_000)
+    end
+
+    test "one_for_all restarts tasks, manager, and server after a server crash", context do
+      _root = start_instance(context)
+      original_server = Process.whereis(context.name)
+      original_manager = GenServer.whereis(manager(context))
+
+      Process.exit(original_server, :kill)
+
+      assert_eventually(fn ->
+        server = Process.whereis(context.name)
+        is_pid(server) and server != original_server
+      end)
+
+      assert :ok = Tailscale.await_ready(context.name, timeout: 2_000)
+      assert GenServer.whereis(manager(context)) != original_manager
+    end
+
+    test "supports an external daemon", context do
+      File.mkdir_p!(Path.dirname(context.socket_path))
+      File.touch!(context.socket_path)
+      opts = Keyword.put(context.opts, :start_daemon, false)
+      _root = start_instance(%{context | opts: opts})
+
+      assert {:ok, %Health{daemon: :external, socket: :ready}} = Tailscale.health(context.name)
+      assert {:ok, %Status{backend_state: :running}} = Tailscale.status(context.name)
+    end
+
+    test "multiple named instances remain isolated", context do
+      _first = start_instance(context)
+      second_mocks = MockTailscale.create_mocks()
+      second_name = :"second_#{System.unique_integer([:positive])}"
+      second_state = Path.join(context.state_dir, "second")
+
+      second_opts =
+        context.opts
+        |> Keyword.put(:name, second_name)
+        |> Keyword.put(:daemon_path, second_mocks.daemon_path)
+        |> Keyword.put(:cli_path, second_mocks.cli_path)
+        |> Keyword.put(:tailscale_dir, second_state)
+        |> Keyword.put(:socket_path, Path.join(second_state, "tailscaled.sock"))
+        |> Keyword.put(:runtime_dir, Path.join(context.runtime_dir, "second"))
+
+      on_exit(fn -> MockTailscale.cleanup_mocks(second_mocks.test_dir) end)
+      {:ok, second_root} = Tailscale.start_link(second_opts)
+      on_exit(fn -> stop_root(second_root) end)
+
+      assert :ok = Tailscale.await_ready(second_name, timeout: 2_000)
+      assert :ok = Tailscale.set(context.name, hostname: "first")
+      assert :ok = Tailscale.set(second_name, hostname: "second")
+
+      assert {:ok, %Preferences{hostname: "first"}} = Tailscale.preferences(context.name)
+      assert {:ok, %Preferences{hostname: "second"}} = Tailscale.preferences(second_name)
     end
   end
 
-  describe "child_spec/1" do
-    test "returns valid child_spec", %{opts: opts} do
-      spec = Tailscale.child_spec(opts)
+  describe "lifecycle chaos" do
+    test "killing tailscaled during a status read returns a lifecycle error", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "status", 0.3)
+      task = Task.async(fn -> Tailscale.status(context.name) end)
+      assert_eventually(fn -> command_started?(context.test_dir, "status") end)
+      {:ok, daemon} = daemon_pid(context)
+      Process.exit(daemon, :kill)
 
-      assert spec.id == Tailscale
-      assert spec.start == {Tailscale, :start_link, [opts]}
+      assert {:error, :daemon_restarting} = Task.await(task, 2_000)
+      assert Process.alive?(Process.whereis(context.name))
+      assert :ok = Tailscale.await_ready(context.name, timeout: 2_000)
+    end
+
+    test "killing tailscaled during login cleans secrets and preserves the server", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "login", 0.3)
+      task = Task.async(fn -> Tailscale.login(context.name, auth_key: "tskey-chaos") end)
+      assert_eventually(fn -> command_started?(context.test_dir, "login") end)
+      {:ok, daemon} = daemon_pid(context)
+      Process.exit(daemon, :kill)
+
+      assert {:error, :daemon_restarting} = Task.await(task, 2_000)
+      refute secret_directories(context)
+      assert Process.alive?(Process.whereis(context.name))
+    end
+
+    test "killing tailscaled during profile switching cancels the mutation", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "switch", 0.3)
+      task = Task.async(fn -> Tailscale.switch_profile(context.name, "profile-2") end)
+      assert_eventually(fn -> command_started?(context.test_dir, "switch") end)
+      {:ok, daemon} = daemon_pid(context)
+      Process.exit(daemon, :kill)
+
+      assert {:error, :daemon_restarting} = Task.await(task, 2_000)
+      refute "switch profile-2" in MockTailscale.mutation_log(context.test_dir)
+    end
+
+    test "reports QEMU-style epipe exits structurally", context do
+      _root = start_instance(context)
+      {:ok, daemon} = daemon_pid(context)
+      Process.exit(daemon, :epipe)
+
+      assert_eventually(fn ->
+        match?(
+          {:ok, %Health{daemon: :restarting, last_daemon_exit: %{reason: :epipe}}},
+          Tailscale.health(context.name)
+        )
+      end)
     end
   end
 
-  describe "daemon_pid/1" do
-    test "returns daemon PID when started", %{opts: opts} do
-      pid = start_and_wait(opts)
+  describe "normalized status and health" do
+    test "returns a typed status", context do
+      _root = start_instance(context)
 
-      assert {:ok, daemon_pid} = Tailscale.daemon_pid(pid)
-      assert is_pid(daemon_pid)
-      assert Process.alive?(daemon_pid)
-
-      GenServer.stop(pid)
-    end
-  end
-
-  describe "version/1" do
-    test "returns version string", %{opts: opts} do
-      pid = start_and_wait(opts)
-
-      assert {:ok, version} = Tailscale.version(pid)
-      assert is_binary(version)
-      assert version =~ "1.88.3"
-
-      GenServer.stop(pid)
-    end
-  end
-
-  describe "status/1" do
-    test "returns status map with JSON data", %{opts: opts} do
-      pid = start_and_wait(opts)
-
-      assert {:ok, status} = Tailscale.status(pid)
-      assert is_map(status)
-      assert status["Self"]["HostName"] == "mock-host"
-      assert status["Self"]["Online"] == true
-
-      GenServer.stop(pid)
-    end
-  end
-
-  describe "login/2" do
-    test "attempts login with auth key", %{opts: opts} do
-      pid = start_and_wait(opts)
-
-      assert {:ok, result} = Tailscale.login(pid, "tskey-mock-12345")
-      assert is_binary(result)
-      assert result =~ "login.tailscale.com"
-
-      GenServer.stop(pid)
-    end
-  end
-
-  describe "online?/1" do
-    test "returns true when online", %{opts: opts} do
-      pid = start_and_wait(opts)
-
-      result = Tailscale.online?(pid)
-      assert is_boolean(result)
-      assert result == true
-
-      GenServer.stop(pid)
-    end
-  end
-
-  describe "typed preferences" do
-    test "sets only explicitly supplied routes with tailscale set", %{
-      opts: opts,
-      mock_dir: mock_dir
-    } do
-      pid = start_and_wait(opts)
-
-      assert :ok =
-               Tailscale.set(pid,
-                 advertise_routes: [
-                   "192.168.10.42/24",
-                   "10.20.0.0/16",
-                   "192.168.10.0/24"
-                 ]
-               )
-
-      assert cli_args(mock_dir) == [
-               "set",
-               "--advertise-routes=192.168.10.0/24,10.20.0.0/16"
-             ]
-
-      GenServer.stop(pid)
+      assert {:ok,
+              %Status{
+                backend_state: :running,
+                authenticated: true,
+                online: true,
+                ipv4: "100.64.0.1",
+                hostname: "mock-host",
+                peers: []
+              }} = Tailscale.status(context.name)
     end
 
-    test "withdraws routes with an empty list and normalizes empty output", %{
-      opts: opts,
-      mock_dir: mock_dir
-    } do
-      pid = start_and_wait(opts)
+    test "preserves unknown startup fields", context do
+      _root = start_instance(context)
 
-      assert :ok = Tailscale.set(pid, advertise_routes: [])
-      assert cli_args(mock_dir) == ["set", "--advertise-routes="]
+      :ok =
+        MockTailscale.configure_status(context.test_dir,
+          backend_state: "Starting",
+          online: "null",
+          have_node_key: "null"
+        )
 
-      GenServer.stop(pid)
+      assert {:ok,
+              %Status{
+                backend_state: :starting,
+                authenticated: :unknown,
+                online: :unknown
+              }} = Tailscale.status(context.name)
     end
 
-    test "rejects invalid or unsupported preference changes before invoking the CLI", %{
-      opts: opts,
-      mock_dir: mock_dir
-    } do
-      pid = start_and_wait(opts)
-      initial_args = cli_args(mock_dir)
+    test "returns lifecycle errors instead of exiting", context do
+      assert {:error, :server_unavailable} = Tailscale.status(:missing_tailscale_server)
 
-      assert {:error, {:invalid_route, "invalid"}} =
-               Tailscale.set(pid, advertise_routes: ["invalid"])
+      _root = start_instance(context)
+      {:ok, daemon} = daemon_pid(context)
+      Process.exit(daemon, :kill)
 
-      assert {:error, {:unsupported_preference, :accept_dns}} =
-               Tailscale.set(pid, accept_dns: true)
-
-      assert {:error, :preferences_required} = Tailscale.set(pid, [])
-      assert cli_args(mock_dir) == initial_args
-
-      GenServer.stop(pid)
+      assert_eventually(fn ->
+        Tailscale.status(context.name) == {:error, :daemon_restarting}
+      end)
     end
 
-    test "returns structured errors when tailscale set fails", %{opts: opts, mock_dir: mock_dir} do
-      pid = start_and_wait(opts)
-      File.touch!(Path.join(mock_dir, "set-error"))
-
-      assert {:error,
-              %Tailscale.CommandError{
-                command: "set",
-                exit_code: 1,
-                output: "failed to update preferences",
-                reason: :exit_status
-              }} = Tailscale.set(pid, advertise_routes: ["192.168.10.0/24"])
-
-      GenServer.stop(pid)
-    end
-
-    test "reads back a typed preference model", %{opts: opts} do
-      pid = start_and_wait(opts)
-      routes = ["192.168.10.0/24", "fd00:1234::/64"]
-
-      assert :ok = Tailscale.set(pid, advertise_routes: routes)
-
-      assert {:ok, %Tailscale.Preferences{advertised_routes: ^routes}} =
-               Tailscale.preferences(pid)
-
-      assert {:ok, ^routes} = Tailscale.advertised_routes(pid)
-
-      GenServer.stop(pid)
-    end
-
-    test "projects advertised, approved, and primary routes", %{opts: opts, mock_dir: mock_dir} do
-      pid = start_and_wait(opts)
+    test "normalizes route state", context do
+      _root = start_instance(context)
       advertised = ["192.168.10.0/24", "10.20.0.0/16"]
 
       :ok =
-        MockTailscale.configure_route_status(mock_dir,
-          approved: ["192.168.10.0/24", "10.20.0.0/16"],
+        MockTailscale.configure_route_status(context.test_dir,
+          approved: advertised,
           primary: ["192.168.10.0/24"]
         )
 
-      assert :ok = Tailscale.set(pid, advertise_routes: advertised)
+      assert :ok = Tailscale.set(context.name, advertise_routes: advertised)
 
       assert {:ok,
               %{
                 advertised: ^advertised,
-                approved: ["192.168.10.0/24", "10.20.0.0/16"],
+                approved: ^advertised,
                 primary: ["192.168.10.0/24"]
-              }} = Tailscale.route_status(pid)
-
-      GenServer.stop(pid)
-    end
-
-    test "exposes forwarding management separately" do
-      assert {:ok, %{ipv4: ipv4?, ipv6: ipv6?}} = Tailscale.forwarding_status()
-      assert is_boolean(ipv4?)
-      assert is_boolean(ipv6?)
-      assert function_exported?(Tailscale, :enable_forwarding, 0)
-      assert function_exported?(Tailscale, :enable_forwarding, 1)
+              }} = Tailscale.route_status(context.name)
     end
   end
 
-  describe "await_ready/2" do
-    test "returns when the daemon accepts status commands", %{opts: opts} do
-      pid = start_and_wait(opts)
+  describe "concurrent scheduler" do
+    test "runs reads concurrently", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "status", 0.2)
 
-      assert :ok = Tailscale.await_ready(pid, timeout: 1_000, interval: 10)
+      started = System.monotonic_time(:millisecond)
+      tasks = for _index <- 1..2, do: Task.async(fn -> Tailscale.status(context.name) end)
+      assert Enum.all?(Task.await_many(tasks, 2_000), &match?({:ok, %Status{}}, &1))
+      elapsed = System.monotonic_time(:millisecond) - started
 
-      GenServer.stop(pid)
+      assert elapsed < 350
     end
 
-    test "retries transient daemon connection failures", %{opts: opts, mock_dir: mock_dir} do
-      pid = start_and_wait(opts)
-      :ok = MockTailscale.configure_status_failures(mock_dir, 2)
+    test "serializes mutations in FIFO order", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "set", 0.1)
 
-      assert :ok = Tailscale.await_ready(pid, timeout: 1_000, interval: 5)
-      assert File.read!(Path.join(mock_dir, "status-failures")) == "0"
+      first = Task.async(fn -> Tailscale.set(context.name, hostname: "first") end)
+      Process.sleep(20)
+      second = Task.async(fn -> Tailscale.switch_profile(context.name, "profile-2") end)
+      Process.sleep(20)
+      third = Task.async(fn -> Tailscale.set(context.name, ssh: false) end)
 
-      GenServer.stop(pid)
+      assert [:ok, :ok, :ok] == Task.await_many([first, second, third], 3_000)
+      assert MockTailscale.mutation_log(context.test_dir) == ["set", "switch profile-2", "set"]
     end
 
-    test "rejects invalid readiness options", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "cancels a queued mutation when its caller dies", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "set", 0.3)
 
-      assert {:error, {:invalid_readiness_options, [timeout: 0]}} =
-               Tailscale.await_ready(pid, timeout: 0)
+      first = Task.async(fn -> Tailscale.set(context.name, hostname: "first") end)
+      Process.sleep(30)
+      doomed = spawn(fn -> Tailscale.switch_profile(context.name, "never-run") end)
+      Process.sleep(30)
+      Process.exit(doomed, :kill)
 
-      assert {:error, {:invalid_readiness_options, [unknown: true]}} =
-               Tailscale.await_ready(pid, unknown: true)
-
-      GenServer.stop(pid)
+      assert :ok = Task.await(first, 2_000)
+      refute "switch never-run" in MockTailscale.mutation_log(context.test_dir)
     end
 
-    test "returns the last structured error after its deadline", %{opts: opts, mock_dir: mock_dir} do
-      pid = start_and_wait(opts)
-      :ok = MockTailscale.configure_status_failures(mock_dir, 100)
+    test "cancels an active mutation and cleans secrets when its caller dies", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "login", 0.5)
 
-      assert {:error,
-              {:readiness_timeout,
-               %Tailscale.CommandError{
-                 command: "status",
-                 exit_code: 1,
-                 reason: :exit_status
-               }}} = Tailscale.await_ready(pid, timeout: 50, interval: 5)
+      caller = spawn(fn -> Tailscale.login(context.name, auth_key: "tskey-abandoned") end)
+      assert_eventually(fn -> command_started?(context.test_dir, "login") end)
+      Process.exit(caller, :kill)
 
-      GenServer.stop(pid)
+      assert_eventually(fn -> active_operation_count(context.name) == 0 end)
+      refute secret_directories(context)
+      refute "login" in MockTailscale.mutation_log(context.test_dir)
+    end
+
+    test "cancels active work on timeout", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "status", 0.5)
+
+      assert {:error, %CommandError{reason: :timeout}} =
+               Tailscale.cli(context.name, "status", ["--json"], mode: :read, timeout: 50)
+
+      assert_eventually(fn -> active_operation_count(context.name) == 0 end)
+    end
+
+    test "single-flight polling skips ticks while a poll is active", context do
+      :ok = MockTailscale.configure_delay(context.test_dir, "status", 0.15)
+      opts = Keyword.put(context.opts, :status_interval, 20)
+      _root = start_instance(%{context | opts: opts}, await?: false)
+      Process.sleep(420)
+
+      status_events =
+        context.test_dir
+        |> MockTailscale.command_log()
+        |> Enum.filter(&String.contains?(&1, " status "))
+
+      assert alternating_start_finish?(status_events)
     end
   end
 
-  describe "cli/3" do
-    test "executes status command with JSON output", %{opts: opts} do
-      pid = start_and_wait(opts)
+  describe "typed enrollment and profiles" do
+    test "uses a protected volatile auth-key file and removes it", context do
+      _root = start_instance(context)
+      key = "tskey-secret-#{System.unique_integer([:positive])}"
+      parent = self()
+      handler = "secret-test-#{System.unique_integer([:positive])}"
 
-      assert {:ok, result} = Tailscale.cli(pid, "status", ["--json"])
-      assert is_map(result)
-      assert result["Self"]["HostName"] == "mock-host"
-      assert result["Self"]["Online"] == true
+      :ok =
+        :telemetry.attach_many(
+          handler,
+          [[:tailscale, :command, :start], [:tailscale, :command, :stop]],
+          &__MODULE__.telemetry_handler/4,
+          parent
+        )
 
-      GenServer.stop(pid)
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   Tailscale.login(context.name,
+                     auth_key: key,
+                     hostname: "gateway",
+                     nickname: "factory",
+                     accept_dns: false
+                   )
+        end)
+
+      refute log =~ key
+      refute inspect(:sys.get_state(context.name)) =~ key
+      auth_argument = File.read!(Path.join(context.test_dir, "login-auth-argument"))
+      assert String.starts_with?(auth_argument, "file:")
+      refute auth_argument =~ key
+      refute File.exists?(String.replace_prefix(auth_argument, "file:", ""))
+      refute secret_directories(context)
+
+      assert_receive {:telemetry, _event, _measurements, metadata}
+      refute inspect(metadata) =~ key
     end
 
-    test "executes ip command", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "cleans abandoned volatile login directories during startup", context do
+      instance_dir = Path.join(context.runtime_dir, Naming.instance_id(context.name))
+      abandoned = Path.join(instance_dir, "login-abandoned")
+      File.mkdir_p!(abandoned)
+      File.write!(Path.join(abandoned, "auth-key"), "abandoned-secret")
 
-      assert {:ok, result} = Tailscale.cli(pid, "ip", [])
-      assert is_binary(result)
-      assert result =~ "100.64.0.1"
-
-      GenServer.stop(pid)
+      _root = start_instance(context)
+      refute File.exists?(abandoned)
     end
 
-    test "executes version command", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "never sends the key to the long-lived server during an active login", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_delay(context.test_dir, "login", 0.3)
+      key = "tskey-process-secret"
+      task = Task.async(fn -> Tailscale.login(context.name, auth_key: key) end)
 
-      assert {:ok, result} = Tailscale.cli(pid, "version", [])
-      assert is_binary(result)
-      assert result =~ "1.88.3"
+      assert_eventually(fn -> command_started?(context.test_dir, "login") end)
+      state = :sys.get_state(context.name)
+      refute inspect(state) =~ key
+      secret_path = active_login_secret_path(state)
+      assert file_mode(secret_path) == 0o600
+      assert file_mode(Path.dirname(secret_path)) == 0o700
+      {processes, 0} = System.cmd("ps", ["-eo", "args"])
+      refute processes =~ key
+      assert processes =~ "--auth-key=file:"
 
-      GenServer.stop(pid)
+      assert :ok = Task.await(task, 2_000)
     end
 
-    test "executes up command", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "redacts an auth key even if the CLI echoes it", context do
+      _root = start_instance(context)
+      File.touch!(Path.join(context.test_dir, "echo-auth-error"))
+      key = "tskey-echoed-by-cli"
 
-      assert {:ok, result} = Tailscale.cli(pid, "up", [])
-      assert is_binary(result)
-      assert result =~ "Success"
+      assert {:error, %CommandError{output: "[REDACTED]"}} =
+               Tailscale.login(context.name, auth_key: key)
 
-      GenServer.stop(pid)
+      refute inspect(:sys.get_state(context.name)) =~ key
     end
 
-    test "executes down command", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "validates login options without echoing secrets", context do
+      _root = start_instance(context)
+      secret = "do-not-echo"
 
-      assert {:ok, result} = Tailscale.cli(pid, "down", [])
-      assert is_binary(result)
-      assert result =~ "Success"
+      assert {:error, {:invalid_login_option, :auth_key}} =
+               Tailscale.login(context.name, auth_key: nil)
 
-      GenServer.stop(pid)
+      assert {:error, {:unknown_login_options, [:unknown]}} =
+               Tailscale.login(context.name, auth_key: secret, unknown: true)
+
+      refute inspect(Tailscale.LoginOptions.encode(auth_key: secret, unknown: true)) =~ secret
     end
 
-    test "executes netcheck command", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "lists, selects, switches, and removes typed profiles", context do
+      _root = start_instance(context)
 
-      assert {:ok, result} = Tailscale.cli(pid, "netcheck", [])
-      assert is_binary(result)
-      assert result =~ "Report"
+      assert {:ok, [%Profile{id: "profile-1", selected?: true} = profile]} =
+               Tailscale.profiles(context.name)
 
-      GenServer.stop(pid)
+      assert {:ok, ^profile} = Tailscale.current_profile(context.name)
+      assert :ok = Tailscale.switch_profile(context.name, "profile-2")
+      assert :ok = Tailscale.remove_profile(context.name, "profile-2")
+
+      assert MockTailscale.mutation_log(context.test_dir) == [
+               "switch profile-2",
+               "switch remove profile-2"
+             ]
     end
 
-    test "executes whois command with JSON", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "supports broader typed preferences and readback", context do
+      _root = start_instance(context)
 
-      assert {:ok, result} = Tailscale.cli(pid, "whois", ["100.64.0.1", "--json"])
-      assert is_map(result)
-      assert result["Node"]["Name"] == "mock-node"
+      assert :ok =
+               Tailscale.set(context.name,
+                 hostname: "gateway",
+                 accept_dns: false,
+                 ssh: false,
+                 advertise_routes: ["192.168.1.42/24"]
+               )
 
-      GenServer.stop(pid)
+      assert {:ok,
+              %Preferences{
+                hostname: "gateway",
+                accept_dns: false,
+                ssh: false,
+                advertised_routes: ["192.168.1.0/24"]
+              }} = Tailscale.preferences(context.name)
+    end
+  end
+
+  describe "readiness and subscriptions" do
+    test "distinguishes daemon readiness from online readiness", context do
+      _root = start_instance(context)
+      :ok = MockTailscale.configure_status(context.test_dir, online: false)
+
+      assert :ok = Tailscale.await_ready(context.name, timeout: 500)
+      assert {:ok, %Status{online: false}} = Tailscale.status(context.name)
+
+      assert {:error, {:online_timeout, %Status{online: false}}} =
+               Tailscale.await_online(context.name,
+                 timeout: 80,
+                 require: [:authenticated, :tailscale_ipv4]
+               )
+
+      :ok = MockTailscale.configure_status(context.test_dir, online: true)
+      assert {:ok, %Status{online: true}} = Tailscale.status(context.name)
+
+      assert :ok =
+               Tailscale.await_online(context.name,
+                 timeout: 500,
+                 require: [:authenticated, :tailscale_ipv4]
+               )
     end
 
-    test "returns a structured error for an unknown command", %{opts: opts} do
-      pid = start_and_wait(opts)
+    test "sends immediate, deduplicated snapshots with monotonic generations", context do
+      opts = Keyword.put(context.opts, :status_interval, 30)
+      _root = start_instance(%{context | opts: opts})
+
+      assert :ok = Tailscale.subscribe(context.name)
+      assert_receive {:tailscale, :status_changed, initial_generation, %Status{}}
+      assert_receive {:tailscale, :health_changed, ^initial_generation, %Health{}}
+
+      :ok = MockTailscale.configure_status(context.test_dir, hostname: "changed")
+
+      assert_receive {:tailscale, :status_changed, generation, %Status{hostname: "changed"}}, 500
+      assert generation > initial_generation
+      refute_receive {:tailscale, :status_changed, _generation, %Status{hostname: "changed"}}, 120
+    end
+
+    test "subscribers converge after daemon restart", context do
+      opts = Keyword.put(context.opts, :status_interval, 30)
+      _root = start_instance(%{context | opts: opts})
+      assert :ok = Tailscale.subscribe(context.name)
+      flush_events()
+      {:ok, daemon} = daemon_pid(context)
+      Process.exit(daemon, :kill)
+
+      assert_receive {:tailscale, :health_changed, restarting_generation,
+                      %Health{daemon: :restarting}},
+                     500
+
+      assert_receive {:tailscale, :status_changed, _generation, %Status{online: :unknown}},
+                     1_000
+
+      assert_receive {:tailscale, :health_changed, running_generation, %Health{daemon: :running}},
+                     1_000
+
+      assert running_generation > restarting_generation
+
+      assert_eventually(fn ->
+        match?({:ok, %Status{online: true}}, Tailscale.status(context.name))
+      end)
+    end
+
+    test "automatically removes dead subscribers", context do
+      _root = start_instance(context)
+
+      parent = self()
+
+      subscriber =
+        spawn(fn ->
+          :ok = Tailscale.subscribe(context.name)
+          send(parent, :subscribed)
+          receive do: (:stop -> :ok)
+        end)
+
+      assert_receive :subscribed
+      send(subscriber, :stop)
+
+      assert_eventually(fn ->
+        state = :sys.get_state(context.name)
+        not Map.has_key?(state.subscriptions.subscribers, subscriber)
+      end)
+    end
+  end
+
+  describe "generic CLI" do
+    test "requires explicit read or mutation mode", context do
+      _root = start_instance(context)
+
+      assert {:error, :invalid_cli_mode} = Tailscale.cli(context.name, "ip", [], [])
+      assert {:ok, ips} = Tailscale.cli(context.name, "ip", [], mode: :read)
+      assert ips =~ "100.64.0.1"
+    end
+
+    test "returns structured command errors", context do
+      _root = start_instance(context)
 
       assert {:error,
-              %Tailscale.CommandError{
+              %CommandError{
                 command: "invalid",
                 exit_code: 1,
-                output: output,
-                reason: :exit_status
-              }} = Tailscale.cli(pid, "invalid", [])
+                reason: :exit_status,
+                output: output
+              }} = Tailscale.cli(context.name, "invalid", [], mode: :read)
 
       assert output =~ "unknown command"
-
-      GenServer.stop(pid)
     end
   end
 
-  describe "concurrent instances" do
-    test "can run multiple instances simultaneously", %{opts: opts1, state_dir: _state_dir} do
-      %{cli_path: cli_path2, daemon_path: daemon_path2, test_dir: mock_dir2} =
-        MockTailscale.create_mocks()
+  defp start_instance(context, opts \\ []) do
+    await? = Keyword.get(opts, :await?, true)
+    {:ok, root} = Tailscale.start_link(context.opts)
+    on_exit(fn -> stop_root(root) end)
 
-      state_dir2 =
-        Path.join(System.tmp_dir!(), "tailscale_state_#{:erlang.unique_integer([:positive])}")
+    assert_eventually(fn -> is_pid(Process.whereis(context.name)) end)
+    if await?, do: assert(:ok == Tailscale.await_ready(context.name, timeout: 2_000))
+    root
+  end
 
-      File.mkdir_p!(state_dir2)
-      socket_path2 = Path.join(state_dir2, "tailscaled.sock")
+  defp stop_root(root) do
+    if is_pid(root) and Process.alive?(root), do: Supervisor.stop(root)
+  catch
+    :exit, _reason -> :ok
+  end
 
-      opts2 = [
-        name: :"test_tailscale_#{:erlang.unique_integer([:positive])}",
-        daemon_path: daemon_path2,
-        cli_path: cli_path2,
-        tailscale_dir: state_dir2,
-        socket_path: socket_path2
-      ]
+  defp manager(context), do: Naming.via(context.name, :daemon_manager)
+  defp daemon_pid(context), do: DaemonManager.daemon_pid(manager(context))
 
-      pid1 = start_and_wait(opts1)
-      pid2 = start_and_wait(opts2)
+  defp active_operation_count(server) do
+    server |> :sys.get_state() |> Map.fetch!(:operations) |> map_size()
+  end
 
-      assert Process.alive?(pid1)
-      assert Process.alive?(pid2)
+  defp secret_directories(context) do
+    instance = Naming.instance_id(context.name)
+    Path.wildcard(Path.join([context.runtime_dir, instance, "login-*"])) != []
+  end
 
-      assert {:ok, daemon1} = Tailscale.daemon_pid(pid1)
-      assert {:ok, daemon2} = Tailscale.daemon_pid(pid2)
-      assert daemon1 != daemon2
+  defp active_login_secret_path(state) do
+    state.operations
+    |> Map.values()
+    |> Enum.find(&(&1.kind == :login))
+    |> Map.fetch!(:arguments)
+    |> Enum.find(&String.starts_with?(&1, "--auth-key=file:"))
+    |> String.replace_prefix("--auth-key=file:", "")
+  end
 
-      assert {:ok, _} = Tailscale.version(pid1)
-      assert {:ok, _} = Tailscale.version(pid2)
+  defp file_mode(path) do
+    {:ok, %File.Stat{mode: mode}} = File.stat(path)
+    Bitwise.band(mode, 0o777)
+  end
 
-      GenServer.stop(pid1)
-      GenServer.stop(pid2)
+  defp command_started?(test_dir, command) do
+    Enum.any?(MockTailscale.command_log(test_dir), &String.starts_with?(&1, "start #{command} "))
+  end
 
-      MockTailscale.cleanup_mocks(mock_dir2)
-      File.rm_rf!(state_dir2)
+  defp alternating_start_finish?(events) do
+    events
+    |> Enum.map(&(String.split(&1, " ", parts: 2) |> hd()))
+    |> Enum.with_index()
+    |> Enum.all?(fn
+      {"start", index} -> rem(index, 2) == 0
+      {"finish", index} -> rem(index, 2) == 1
+    end)
+  end
+
+  defp flush_events do
+    receive do
+      {:tailscale, _event, _generation, _value} -> flush_events()
+    after
+      0 -> :ok
     end
   end
 
-  describe "supervision" do
-    test "can be supervised", %{opts: opts} do
-      children = [{Tailscale, opts}]
-
-      assert {:ok, supervisor} = Supervisor.start_link(children, strategy: :one_for_one)
-
-      Process.sleep(100)
-
-      [{Tailscale, child_pid, :worker, [Tailscale]}] = Supervisor.which_children(supervisor)
-      assert Process.alive?(child_pid)
-
-      wait_for_daemon(child_pid)
-      assert {:ok, daemon_pid} = Tailscale.daemon_pid(child_pid)
-      assert Process.alive?(daemon_pid)
-
-      Supervisor.stop(supervisor)
-    end
-
-    test "supervisor restarts child after crash", %{opts: opts} do
-      children = [{Tailscale, opts}]
-
-      assert {:ok, supervisor} = Supervisor.start_link(children, strategy: :one_for_one)
-      Process.sleep(100)
-
-      [{Tailscale, original_pid, :worker, [Tailscale]}] = Supervisor.which_children(supervisor)
-      wait_for_daemon(original_pid)
-
-      Process.exit(original_pid, :kill)
-      Process.sleep(100)
-
-      [{Tailscale, new_pid, :worker, [Tailscale]}] = Supervisor.which_children(supervisor)
-      assert Process.alive?(new_pid)
-      assert new_pid != original_pid
-
-      Supervisor.stop(supervisor)
-    end
+  defp assert_eventually(fun, timeout \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_assert_eventually(fun, deadline)
   end
 
-  describe "daemon lifecycle" do
-    test "daemon is started automatically on init", %{opts: opts} do
-      pid = start_and_wait(opts)
-      {:ok, daemon_pid} = Tailscale.daemon_pid(pid)
+  defp do_assert_eventually(fun, deadline) do
+    cond do
+      fun.() ->
+        :ok
 
-      assert Process.alive?(daemon_pid)
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("condition was not met before timeout")
 
-      GenServer.stop(pid)
-      refute Process.alive?(daemon_pid)
-    end
-  end
-
-  describe "timeout handling" do
-    test "respects custom timeout setting", %{opts: opts} do
-      opts = Keyword.put(opts, :timeout, 10_000)
-      pid = start_and_wait(opts)
-
-      # Verify it started successfully with custom timeout
-      assert Process.alive?(pid)
-
-      GenServer.stop(pid)
+      true ->
+        Process.sleep(10)
+        do_assert_eventually(fun, deadline)
     end
   end
 end

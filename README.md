@@ -1,14 +1,21 @@
 # Tailscale
 
-An Elixir wrapper for [Tailscale](https://tailscale.com), providing a supervised GenServer to manage the `tailscaled` daemon and execute CLI commands.
+A Linux-focused Elixir runtime for [Tailscale](https://tailscale.com). It owns
+`tailscaled`, safely schedules CLI operations, normalizes unstable JSON, and
+provides typed enrollment, profile, preference, readiness, health, and subnet
+router APIs.
 
 ## Features
 
-- 🚀 **Supervised daemon management** - Full lifecycle control via `MuonTrap`
-- 🔌 **Custom socket paths** - Works in embedded/Nerves environments
-- ⏱️ **Configurable timeouts** - Prevent hanging commands
-- 📦 **Linux binary installer** - Detects the runtime ABI and installs verified, pinned binaries
-- 🌐 **Typed route preferences** - Configures, reads, and reconciles subnet routing state
+- Internally supervised `tailscaled` with bounded restart backoff
+- Concurrent reads and FIFO-serialized mutations
+- Nil-safe `%Tailscale.Status{}` and `%Tailscale.Health{}` models
+- Secret-safe enrollment through volatile `0600` auth-key files
+- Typed local profile management and preferences
+- Daemon and online readiness barriers
+- Deduplicated status and health subscriptions
+- Secret-free telemetry
+- Verified, architecture-aware Linux binary installer
 
 ## Installation
 
@@ -20,65 +27,203 @@ def deps do
 end
 ```
 
-## Quick Start
+## Supervision
 
-### Basic Usage
+Add one named instance to your application supervisor:
 
 ```elixir
-# Start the Tailscale GenServer
-{:ok, pid} = Tailscale.start_link()
+children = [
+  {Tailscale,
+    name: Tailscale,
+    daemon_path: "/usr/sbin/tailscaled",
+    cli_path: "/usr/bin/tailscale",
+    socket_path: "/run/tailscale/tailscaled.sock",
+    tailscale_dir: "/data/tailscale",
+    runtime_dir: "/run/tailscale_ex",
+    tun: :kernel}
+]
 
-# Check if online
-Tailscale.online?()
-# => false
-
-# Get status as a map
-{:ok, status} = Tailscale.status()
-
-# Register device with auth-key
-{:ok, _} = Tailscale.login("your-auth-key")
-
-# Execute CLI commands
-{:ok, ips} = Tailscale.cli("ip", [])
+Supervisor.start_link(children, strategy: :one_for_one)
 ```
 
-### Supervised Usage
+Each instance internally uses a `:one_for_all` supervisor containing a command
+`Task.Supervisor`, daemon manager, and public server. Ordinary `tailscaled`
+exits are handled by the daemon manager without restarting the public server.
+If the public state owner fails, all command tasks and daemon ownership restart
+together so no work survives with stale ownership.
+
+Read commands run concurrently, while login, profile, preference, and
+explicitly mutating CLI operations execute FIFO. Work is cancelled when its
+caller exits or its timeout expires. Cancellation is best effort because an
+operation may already have reached `tailscaled`; callers should reconcile
+through typed readback.
+
+Important options:
+
+| Option | Default | Description |
+|---|---|---|
+| `:name` | `Tailscale` | Public instance name |
+| `:daemon_path` | `/usr/sbin/tailscaled` | Daemon executable |
+| `:cli_path` | `/usr/bin/tailscale` | CLI executable |
+| `:start_daemon` | `true` | Manage the daemon or attach to an external one |
+| `:socket_path` | `/run/tailscale/tailscaled.sock` | Unix socket |
+| `:tailscale_dir` | `/data/tailscale` | Persistent daemon state |
+| `:runtime_dir` | `/run/tailscale_ex` | Volatile secret storage |
+| `:tun` | `:kernel` | `:kernel`, `:userspace`, or interface name |
+| `:command_timeout` | `30_000` | Per-operation timeout in milliseconds |
+| `:status_interval` | `1_000` | Single-flight monitor interval |
+| `:daemon_log_level` | `:info` | Logger level or `false` |
+| `:daemon_stdio_window` | `10_240` | MuonTrap output flow-control window |
+
+## Status and health
 
 ```elixir
-defmodule MyApp.Application do
-  use Application
+{:ok,
+ %Tailscale.Status{
+   backend_state: :running,
+   authenticated: true,
+   online: true,
+   ipv4: "100.64.0.1",
+   ipv6: nil,
+   hostname: "gateway",
+   peers: []
+ }} = Tailscale.status()
 
-  def start(_type, _args) do
-    children = [
-      {Tailscale,
-        name: Tailscale,
-        tailscale_dir: "/data/tailscale",
-        socket_path: "/tmp/tailscale.sock"}
-    ]
+{:ok,
+ %Tailscale.Health{
+   client: :running,
+   daemon: :running,
+   socket: :ready,
+   authenticated: true,
+   online: true
+ }} = Tailscale.health()
+```
 
-    Supervisor.start_link(children, strategy: :one_for_one)
-  end
+Unavailable startup fields remain `:unknown`; they are never incorrectly
+normalized to `false`. Expected lifecycle races return values such as:
+
+```elixir
+{:error, :server_unavailable}
+{:error, :daemon_restarting}
+{:error, :socket_unavailable}
+```
+
+Public APIs do not leak `GenServer.call/3` exits.
+
+## Enrollment
+
+```elixir
+:ok =
+  Tailscale.login(
+    auth_key: auth_key,
+    hostname: "gateway-01",
+    nickname: "Factory Gateway",
+    accept_dns: false
+  )
+```
+
+The auth key is written under the volatile runtime directory using a random
+`0700` directory and `0600` file. The CLI receives only a `file:PATH`
+reference. The key is omitted from long-lived process messages, command
+arguments, errors, logs, and telemetry, and the file is removed after the
+operation.
+
+## Profiles
+
+```elixir
+{:ok, profiles} = Tailscale.profiles()
+{:ok, %Tailscale.Profile{id: id}} = Tailscale.current_profile()
+:ok = Tailscale.switch_profile(id)
+:ok = Tailscale.remove_profile(id)
+```
+
+Profile commands use Tailscale's local profile interface and may require root or
+a configured Tailscale operator.
+
+## Typed preferences
+
+Only explicitly supplied preferences change; the implementation always invokes
+`tailscale set`, never `tailscale up`:
+
+```elixir
+:ok =
+  Tailscale.set(
+    hostname: "gateway-01",
+    accept_dns: false,
+    ssh: false,
+    advertise_routes: ["192.168.1.0/24", "10.0.0.0/24"]
+  )
+
+:ok = Tailscale.set(advertise_routes: [])
+
+{:ok,
+ %Tailscale.Preferences{
+   hostname: "gateway-01",
+   accept_dns: false,
+   ssh: false,
+   advertised_routes: routes
+ }} = Tailscale.preferences()
+```
+
+Route CIDRs are canonicalized and deduplicated. Approval remains a tailnet
+policy or admin-console responsibility:
+
+```elixir
+{:ok, %{advertised: advertised, approved: approved, primary: primary}} =
+  Tailscale.route_status()
+```
+
+## Readiness
+
+Daemon readiness only proves that the local socket accepts commands and also
+works before enrollment:
+
+```elixir
+:ok = Tailscale.await_ready(timeout: 10_000)
+```
+
+Online readiness requires a running, online backend and can impose additional
+normalized requirements:
+
+```elixir
+:ok =
+  Tailscale.await_online(
+    timeout: 30_000,
+    require: [:authenticated, :tailscale_ipv4]
+  )
+```
+
+## Subscriptions
+
+```elixir
+:ok = Tailscale.subscribe()
+
+receive do
+  {:tailscale, :status_changed, generation, status} ->
+    IO.inspect({generation, status})
+
+  {:tailscale, :health_changed, generation, health} ->
+    IO.inspect({generation, health})
 end
 ```
 
-## Configuration Options
+Subscribers receive immediate snapshots. Later events are structurally
+deduplicated, carry a monotonic per-instance generation, and include transition
+timestamps in their structs. Dead subscribers are removed automatically.
 
-| Option           | Default                           | Description                  |
-|------------------|-----------------------------------|------------------------------|
-| `:name`          | `Tailscale`                       | GenServer name               |
-| `:daemon_path`   | `/usr/sbin/tailscaled`            | Path to daemon binary        |
-| `:cli_path`      | `/usr/bin/tailscale`              | Path to CLI binary           |
-| `:start_daemon`  | `true`                            | Manage a daemon or use an existing one |
-| `:socket_path`   | `/run/tailscale/tailscaled.sock`  | Unix socket path             |
-| `:tailscale_dir` | `/data/tailscale`                 | State directory              |
-| `:tun`           | `:kernel`                         | Kernel, userspace, or custom TUN interface |
-| `:timeout`       | `5_000`                           | Command timeout (ms)         |
+## Generic CLI escape hatch
+
+Scheduling semantics must be explicit:
+
+```elixir
+{:ok, ips} = Tailscale.cli("ip", ["--4"], mode: :read)
+{:ok, _output} = Tailscale.cli("down", [], mode: :mutation)
+```
+
+Unknown commands are never classified automatically. Typed APIs should be
+preferred for mutations.
 
 ## Installing Linux binaries dynamically
-
-`Tailscale.Binary` can detect the ABI of the running Linux BEAM and install a
-pinned Tailscale release. Installation is explicit and never happens as a side
-effect of `Tailscale.start_link/1`:
 
 ```elixir
 {:ok, binaries} =
@@ -86,170 +231,57 @@ effect of `Tailscale.start_link/1`:
     version: "1.102.3",
     install_dir: "/data/tailscale/bin"
   )
-
-{:ok, pid} =
-  Tailscale.start_link(
-    daemon_path: binaries.daemon_path,
-    cli_path: binaries.cli_path
-  )
 ```
 
-The installer supports Tailscale's Linux `amd64`, `386`, `arm`, `arm64`,
-`mips`, `mipsle`, `mips64`, `mips64le`, and `riscv64` archives. It uses the
-BEAM runtime ABI rather than the physical CPU, downloads both binaries from the
-official stable package repository, verifies the published SHA-256 checksum,
-and atomically caches them by version and architecture.
+The installer detects the running BEAM ABI, downloads the official stable Linux
+archive, verifies its published SHA-256 checksum, and atomically installs both
+`tailscale` and `tailscaled`. Exact versions are required. Supported artifacts
+include `amd64`, `386`, `arm`, `arm64`, MIPS variants, and `riscv64`.
 
-An exact `:version` is required. You can provide an independently trusted
-checksum with `sha256: "..."`, or a custom CA bundle with
-`cacertfile: "/path/to/cacerts.pem"`. The installation directory must be
-persistent and writable. For reproducible Nerves production firmware, bundling
-pinned binaries at build time remains preferable to downloading them during
-boot.
+## Nerves subnet routers
 
-## Linux subnet routing
-
-Linux must enable kernel forwarding before Tailscale can route advertised
-subnets. The top-level API can inspect and enable it for the current boot:
+The Nerves system needs kernel TUN support (`CONFIG_TUN`) and `/dev/net/tun`.
+Enable forwarding during each boot when `/etc` is immutable:
 
 ```elixir
-{:ok, %{ipv4: false, ipv6: false}} = Tailscale.forwarding_status()
 :ok = Tailscale.enable_forwarding()
+:ok = Tailscale.await_ready(timeout: 10_000)
+:ok = Tailscale.set(advertise_routes: ["192.168.1.0/24"])
 ```
 
-On a conventional writable Linux system, persist the settings in an idempotent
-`/etc/sysctl.d/99-tailscale.conf` as well:
+On conventional writable Linux, persist forwarding idempotently:
 
 ```elixir
 :ok = Tailscale.enable_forwarding(persist: :sysctl_d)
 ```
 
-The calling OS process must have permission to write `/proc` and, when
-requested, `/etc/sysctl.d`. The library never invokes `sudo`.
+This writes `/etc/sysctl.d/99-tailscale.conf` and applies the settings through
+`/proc`. The calling OS process needs suitable permissions; the library never
+invokes `sudo`.
 
-Advertise IPv4 or IPv6 CIDRs after the node is authenticated:
+## Telemetry
 
-```elixir
-:ok =
-  Tailscale.set(
-    advertise_routes: [
-      "192.168.1.0/24",
-      "10.0.0.0/24"
-    ]
-  )
-```
-
-`set/1` validates, canonicalizes, and deduplicates CIDRs. It invokes
-`tailscale set`, so preferences not explicitly supplied remain unchanged. Pass
-an empty list to withdraw every advertised route:
-
-```elixir
-:ok = Tailscale.set(advertise_routes: [])
-```
-
-Read back configured preferences or compare local configuration with the
-control-plane view:
-
-```elixir
-{:ok, %Tailscale.Preferences{advertised_routes: routes}} =
-  Tailscale.preferences()
-
-{:ok, %{advertised: advertised, approved: approved, primary: primary}} =
-  Tailscale.route_status()
-```
-
-Routes must still be approved in the Tailscale admin console or by suitable
-`autoApprovers` policy. Forwarding configuration is deliberately separate from
-preference updates, allowing desired settings to be persisted and reconciled
-independently.
-
-## Nerves Integration
-
-For embedded/Nerves projects:
-
-```elixir
-{Tailscale,
-  name: Tailscale,
-  daemon_path: "/data/tailscaled",
-  cli_path: "/data/tailscale",
-  socket_path: "/run/tailscale/tailscale.sock",
-  tailscale_dir: "/data/tailscale",
-  tun: :kernel}
-```
-
-Kernel TUN mode is the default. It follows the upstream `tailscaled` default interface (`tailscale0`) by omitting the `--tun` flag. This is the recommended mode for a Nerves subnet router because it supports all IP protocols and uses the Linux routing stack.
-
-The Nerves system must include kernel TUN support (`CONFIG_TUN`) and expose
-`/dev/net/tun`. Since `/etc` may be immutable, enable forwarding during each
-boot before advertising routes:
-
-```elixir
-:ok = Tailscale.enable_forwarding()
-:ok = Tailscale.await_ready(timeout: 10_000)
-:ok = Tailscale.set(advertise_routes: ["192.168.1.0/24", "10.0.0.0/24"])
-```
-
-`await_ready/1` only waits for the daemon socket to accept commands. It also
-succeeds in pre-enrollment states such as `NeedsLogin`.
-
-If a target has no TUN device, explicitly select netstack mode with
-`tun: :userspace`. A custom kernel interface name such as `tun: "ts-nerves0"`
-is also supported.
+The library emits command duration/outcome, daemon exit/restart, and normalized
+status/health transition events under the `[:tailscale, ...]` prefix. Metadata
+contains operation and outcome identifiers only—never arguments, profile IDs,
+hostnames, routes, CLI output, or secrets.
 
 ## Testing
-
-Unit tests use mock `tailscale` and `tailscaled` binaries and do not require a tailnet:
 
 ```bash
 mix ci
 ```
 
-The integration test uses the installed Tailscale CLI and a real, connected daemon. It exercises this library's version parsing, JSON status parsing, online detection, and IP command handling:
+The real integration test attaches to an installed daemon without replacing it:
 
 ```bash
 mix test --only integration test/integration/tailscale_integration_test.exs
 ```
 
-The test defaults to `/var/run/tailscale/tailscaled.sock`. Set `TAILSCALE_SOCKET` or `TAILSCALE_CLI_PATH` when reproducing against a non-default local installation. The test attaches with `start_daemon: false`, so it does not stop or replace the machine's existing daemon.
-
-### Tailscale compatibility CI
-
-`.github/workflows/ci.yml` runs the unit suite independently and then uses `tailscale/github-action@v4` to create an ephemeral `tag:ci` node. Pull requests are tested against `version: latest`; a separate `unstable` matrix entry is an allowed-to-fail early warning.
-
-The action authenticates with GitHub OIDC workload identity federation. Maintainers must configure these GitHub Actions secrets:
-
-- `TS_OAUTH_CLIENT_ID` — the Tailscale federated identity client ID
-- `TS_AUDIENCE` — its configured audience
-
-The Tailscale trust credential must have writable `auth_keys` scope and permission to create nodes tagged `tag:ci`. The workflow requests `id-token: write`; no reusable auth key or OAuth client secret is stored in the repository. The action marks its node ephemeral and logs it out after the job.
-
-## Troubleshooting
-
-### Daemon won't start
-
-Check that:
-- Binaries exist and are executable
-- Socket directory is writable
-- State directory is writable
-- No other Tailscale instance is using the same socket
-- `/dev/net/tun` exists when using the default `:kernel` mode
-
-### Commands timeout
-
-Increase the timeout in configuration:
-
-```elixir
-{Tailscale, timeout: 30_000}  # 30 seconds
-```
-
-### Permission errors on Nerves
-
-Ensure binaries have execute permissions:
-
-```bash
-chmod +x /usr/sbin/tailscaled
-chmod +x /usr/bin/tailscale
-```
+Set `TAILSCALE_SOCKET` or `TAILSCALE_CLI_PATH` for non-default installations.
+CI tests stable and unstable Tailscale channels using GitHub OIDC workload
+identity federation. It expects `TS_OAUTH_CLIENT_ID` and `TS_AUDIENCE`; no
+reusable auth key or OAuth client secret is stored in GitHub.
 
 ## License
 

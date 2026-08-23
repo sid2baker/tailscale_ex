@@ -4,7 +4,7 @@ defmodule Tailscale.MixProject do
   def project do
     [
       app: :tailscale,
-      version: "0.1.0",
+      version: "0.2.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -17,6 +17,7 @@ defmodule Tailscale.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
+      mod: {Tailscale.Application, []},
       extra_applications: [:crypto, :inets, :logger, :ssl]
     ]
   end
@@ -36,7 +37,8 @@ defmodule Tailscale.MixProject do
       {:dialyxir, "~> 1.0", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.0", only: [:dev, :test], runtime: false},
       {:vibe_kit, "~> 0.1"},
-      {:muontrap, "~> 1.0"}
+      {:muontrap, "~> 1.0"},
+      {:telemetry, "~> 1.3"}
     ]
   end
 
