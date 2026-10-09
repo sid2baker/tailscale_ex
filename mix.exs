@@ -8,6 +8,7 @@ defmodule Tailscale.MixProject do
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"]),
       dialyzer: [plt_add_apps: [:ex_unit]],
       aliases: aliases(),
       test_ignore_filters: [&String.starts_with?(&1, "test/support/")]
@@ -36,14 +37,15 @@ defmodule Tailscale.MixProject do
       {:ex_dna, "~> 1.0", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.0", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.0", only: [:dev, :test], runtime: false},
-      {:vibe_kit, "~> 0.1"},
-      {:muontrap, "~> 1.0"},
-      {:telemetry, "~> 1.3"}
+      {:mint, "~> 1.11"},
+      {:property_table, "~> 0.3.4"},
+      {:muontrap, "~> 1.0"}
     ]
   end
 
   defp aliases() do
     [
+      test: ["test --no-start"],
       ci: [
         "compile --warnings-as-errors",
         "format --check-formatted",

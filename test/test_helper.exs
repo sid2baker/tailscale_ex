@@ -1,4 +1,15 @@
-ExUnit.start(exclude: [:integration])
+# mix test uses --no-start: boot dependencies, not a default networking instance.
+Application.load(:tailscale)
 
-# Load test support modules
-Code.require_file("support/mock_tailscale.ex", __DIR__)
+for app <- Application.spec(:tailscale, :applications) do
+  {:ok, _} = Application.ensure_all_started(app)
+end
+
+exclude = if System.get_env("TAILSCALED_TEST_BINARY"), do: [], else: [integration: true]
+
+exclude =
+  if System.get_env("TAILSCALE_TEST_NETWORK") == "1",
+    do: exclude,
+    else: [network: true] ++ exclude
+
+ExUnit.start(exclude: exclude)

@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      network_tests:
+        description: Contact the Tailscale control plane for URL and invalid-key tests
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,7 +22,6 @@ jobs:
   unit:
     name: Unit tests and quality checks
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -37,24 +41,9 @@ jobs:
       - name: Run CI checks
         run: mix ci
 
-  tailscale-compatibility:
-    name: Tailscale compatibility (${{ matrix.channel }}, ${{ matrix.tailscale-version }})
+  daemon:
+    name: Isolated Tailscale 1.102.3 userspace integration
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.experimental }}
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - channel: stable
-            tailscale-version: latest
-            experimental: false
-          - channel: unstable
-            tailscale-version: unstable
-            experimental: true
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -71,31 +60,16 @@ jobs:
           mix local.rebar --force
           mix deps.get
 
-      - name: Set up Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          audience: ${{ secrets.TS_AUDIENCE }}
-          tags: tag:ci
-          version: ${{ matrix.tailscale-version }}
-
-      - name: Verify Tailscale version and connection
+      - name: Fetch pinned daemon and verify archive
         run: |
-          tailscale version
-          tailscale status
+          curl --fail --location --retry 3 \
+            https://pkgs.tailscale.com/stable/tailscale_1.102.3_amd64.tgz \
+            --output "$RUNNER_TEMP/tailscale.tgz"
+          echo "36ddd9b51be57ffc2990cf76323cfa13643bfbb1b8a969f6183fa164741cdef5  $RUNNER_TEMP/tailscale.tgz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/tailscale.tgz" -C "$RUNNER_TEMP"
+          echo "TAILSCALED_TEST_BINARY=$RUNNER_TEMP/tailscale_1.102.3_amd64/tailscaled" >> "$GITHUB_ENV"
 
-      - name: Build library
-        run: mix compile --warnings-as-errors
-
-      - name: Run Tailscale integration tests
-        run: mix test --only integration test/integration/tailscale_integration_test.exs
-
-      - name: Show Tailscale diagnostics after failure
-        if: failure()
-        run: |
-          if command -v tailscale >/dev/null 2>&1; then
-            tailscale version || true
-            tailscale status || true
-          else
-            echo "tailscale executable was not installed"
-          fi
+      - name: Run real-daemon tests (never attach to a host daemon)
+        env:
+          TAILSCALE_TEST_NETWORK: ${{ inputs.network_tests && '1' || '0' }}
+        run: mix test test/integration/daemon_test.exs
