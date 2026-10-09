@@ -9,7 +9,7 @@ defmodule Tailscale.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"]),
-      dialyzer: [plt_add_apps: [:ex_unit]],
+      dialyzer: [plt_add_apps: [:ex_unit, :mix]],
       aliases: aliases(),
       test_ignore_filters: [&String.starts_with?(&1, "test/support/")]
     ]
