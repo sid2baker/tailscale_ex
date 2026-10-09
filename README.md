@@ -62,23 +62,29 @@ Tailscale.get(["auth", "url"]) # Open this URL; it may take a moment to appear.
 Wait for `Tailscale.get(["state"]) == :online`. Login initiates enrollment; it does
 not wait for completion. `Tailscale.logout/0` logs out without deleting identity.
 
-`configure/1` replaces the **complete managed configuration**; omitted fields
-return to defaults. Startup only reads existing settings. The daemon owns
-persistence; settings made before enrollment may be lost on restart. Failed
-writes return `{:error, reason}` and are not queued or retried.
+Both configuration APIs work while running:
+
+- `configure/1` replaces the **complete managed configuration**; omitted fields use defaults.
+- `update_configuration/1` changes only supplied fields, preserving the rest from a fresh
+  daemon read. Lists replace completely; updates from library callers are serialized.
+
+Startup only reads existing settings. The daemon owns persistence; settings made
+before enrollment may be lost on restart. Failed operations return `{:error, reason}`
+and writes are not queued or retried.
 
 ## Serve an HTTP app over HTTPS
 
 Enable MagicDNS and HTTPS in your tailnet. After login, wait for the expected
-`Tailscale.get(["dns_name"])`, then:
+`Tailscale.get(["dns_name"])`, then enable Serve without changing other settings:
 
 ```elixir
-%{} = current = Tailscale.get_configuration()
-:ok = Tailscale.configure(%{current | serve: [%{https: 443, to: "http://127.0.0.1:4000"}]})
+:ok = Tailscale.update_configuration(%{
+  serve: [%{https: 443, to: "http://127.0.0.1:4000"}]
+})
 ```
 
 Visit `https://<dns_name>/` from an authorized tailnet device. This does not enable
-public Funnel access or replace your app's authentication. Configure/reset replaces
+public Funnel access or replace your app's authentication. Setting `serve` replaces
 all top-level Serve listeners and Funnel settings; `serve: []` removes them.
 
 ## Read state and subscribe

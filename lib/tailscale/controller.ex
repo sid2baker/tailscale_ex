@@ -8,6 +8,10 @@ defmodule Tailscale.Controller do
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :controller))
 
   def configure(server, config), do: GenServer.call(server, {:configure, config}, :infinity)
+
+  def update_configuration(server, changes),
+    do: GenServer.call(server, {:update_configuration, changes}, :infinity)
+
   def reset(server), do: GenServer.call(server, :reset, :infinity)
   def login(server, mode), do: GenServer.call(server, {:login, mode}, :infinity)
   def logout(server), do: GenServer.call(server, :logout, :infinity)
@@ -28,6 +32,11 @@ defmodule Tailscale.Controller do
   @impl true
   def handle_call({:configure, config}, _from, state) do
     {result, state} = configure_now(state, config)
+    {:reply, result, state}
+  end
+
+  def handle_call({:update_configuration, changes}, _from, state) do
+    {result, state} = update_now(state, changes)
     {:reply, result, state}
   end
 
@@ -69,6 +78,17 @@ defmodule Tailscale.Controller do
 
   @impl true
   def format_status(status), do: Map.put(status, :message, :redacted)
+
+  defp update_now(state, changes) do
+    with {:ok, _validated} <- Configuration.normalize(changes),
+         {:ok, state} <- refresh(state) do
+      current = PropertyTable.get(state.table, ["configuration", "value"])
+      configure_now(state, Map.merge(current, changes))
+    else
+      {:error, _reason} = error -> {error, state}
+      {error, updated_state} -> {error, updated_state}
+    end
+  end
 
   defp configure_now(state, input) do
     case Configuration.normalize(input) do

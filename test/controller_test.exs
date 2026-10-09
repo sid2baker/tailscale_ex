@@ -63,6 +63,132 @@ defmodule Tailscale.ControllerTest do
     assert UnixHTTP.state(ctx.daemon).prefs["Hostname"] == configuration(ctx).hostname
   end
 
+  test "updates preserve omitted fields and replace or remove lists", ctx do
+    dns(ctx)
+
+    original = %{
+      hostname: "existing",
+      accept_dns: false,
+      accept_routes: true,
+      ssh: true,
+      advertise_routes: ["10.0.0.0/24"],
+      serve: [%{https: 443, to: "http://localhost:4000"}]
+    }
+
+    assert :ok = Controller.configure(ctx.controller, original)
+
+    changes = %{
+      advertise_routes: ["192.168.1.0/24"],
+      serve: [%{https: 8443, to: "http://localhost:8080"}]
+    }
+
+    assert :ok = Controller.update_configuration(ctx.controller, changes)
+    assert configuration(ctx) == Map.merge(original, changes)
+    assert UnixHTTP.state(ctx.daemon).serve["TCP"] == %{"8443" => %{"HTTPS" => true}}
+    assert UnixHTTP.state(ctx.daemon).prefs["Unmanaged"] == "kept"
+
+    assert :ok = Controller.update_configuration(ctx.controller, %{ssh: false})
+    assert configuration(ctx) == original |> Map.merge(changes) |> Map.put(:ssh, false)
+
+    assert :ok =
+             Controller.update_configuration(ctx.controller, %{serve: [], advertise_routes: []})
+
+    assert configuration(ctx).serve == []
+    assert configuration(ctx).advertise_routes == []
+    assert configuration(ctx).hostname == "existing"
+    assert configuration(ctx).accept_routes
+    refute configuration(ctx).accept_dns
+    refute configuration(ctx).ssh
+
+    before = writes(UnixHTTP.state(ctx.daemon))
+    assert :ok = Controller.update_configuration(ctx.controller, %{})
+    assert writes(UnixHTTP.state(ctx.daemon)) == before
+  end
+
+  test "updates read fresh preferences and Serve rather than merging the cached snapshot", ctx do
+    dns(ctx)
+    assert :ok = Controller.configure(ctx.controller, %{hostname: "cached"})
+    endpoints = [%{https: 8443, to: "http://localhost:8080"}]
+    {:ok, serve} = Tailscale.Serve.build(%{}, endpoints, "device.ts.net")
+
+    UnixHTTP.update(ctx.daemon, fn state ->
+      %{state | prefs: Map.put(state.prefs, "Hostname", "external"), serve: serve, etag: 2}
+    end)
+
+    before = length(UnixHTTP.state(ctx.daemon).requests)
+    assert :ok = Controller.update_configuration(ctx.controller, %{accept_dns: false})
+    assert configuration(ctx).hostname == "external"
+    assert configuration(ctx).serve == endpoints
+    refute configuration(ctx).accept_dns
+
+    requests = ctx.daemon |> UnixHTTP.state() |> Map.fetch!(:requests) |> Enum.drop(before)
+
+    assert [
+             %{method: "GET", path: "/localapi/v0/prefs"},
+             %{method: "GET", path: "/localapi/v0/serve-config"} | _
+           ] = requests
+  end
+
+  test "concurrent updates preserve all disjoint changes", ctx do
+    dns(ctx)
+
+    expected = %{
+      hostname: "concurrent",
+      accept_dns: false,
+      accept_routes: true,
+      ssh: true,
+      advertise_routes: ["10.0.0.0/24"],
+      serve: [%{https: 443, to: "http://localhost:4000"}]
+    }
+
+    tasks =
+      for {key, value} <- expected do
+        Task.async(fn -> Controller.update_configuration(ctx.controller, %{key => value}) end)
+      end
+
+    assert Enum.all?(Task.await_many(tasks), &(&1 == :ok))
+    assert configuration(ctx) == expected
+  end
+
+  test "failed update reads clear the cache and never write or replay changes", ctx do
+    assert :ok = Controller.configure(ctx.controller, %{hostname: "retained", accept_dns: false})
+    before = writes(UnixHTTP.state(ctx.daemon))
+
+    for path <- ["/localapi/v0/prefs", "/localapi/v0/serve-config"] do
+      UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"GET", path}], 503))
+
+      assert {:error, {:http, 503}} =
+               Controller.update_configuration(ctx.controller, %{hostname: "must-not-apply"})
+
+      assert configuration(ctx) == nil
+      assert PropertyTable.get(ctx.table, ["configuration", "error"]) == {:http, 503}
+      assert writes(UnixHTTP.state(ctx.daemon)) == before
+      UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
+      eventually(fn -> assert %{hostname: "retained", accept_dns: false} = configuration(ctx) end)
+      assert writes(UnixHTTP.state(ctx.daemon)) == before
+    end
+  end
+
+  test "failed update writes are not retried and leave existing settings intact", ctx do
+    assert :ok = Controller.configure(ctx.controller, %{hostname: "retained", accept_dns: false})
+    UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"PATCH", "/localapi/v0/prefs"}], 503))
+    assert {:error, {:http, 503}} = Controller.update_configuration(ctx.controller, %{ssh: true})
+    assert configuration(ctx).hostname == "retained"
+    refute configuration(ctx).accept_dns
+    refute configuration(ctx).ssh
+    assert PropertyTable.get(ctx.table, ["configuration", "error"]) == {:http, 503}
+    before = writes(UnixHTTP.state(ctx.daemon))
+    UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
+    UnixHTTP.notify(ctx.daemon, %{"Prefs" => %{}})
+
+    eventually(fn ->
+      assert PropertyTable.get(ctx.table, ["configuration", "state"]) == :ready
+    end)
+
+    assert writes(UnixHTTP.state(ctx.daemon)) == before
+    refute configuration(ctx).ssh
+  end
+
   test "failed mutations return errors and are never retried, even after a notification", ctx do
     for status <- [503, 400] do
       UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"PATCH", "/localapi/v0/prefs"}], status))
@@ -161,6 +287,10 @@ defmodule Tailscale.ControllerTest do
     end)
 
     assert configuration(ctx) == nil
+
+    assert {:error, :unsupported_serve_configuration} =
+             Controller.update_configuration(ctx.controller, %{hostname: "must-not-apply"})
+
     assert writes(UnixHTTP.state(ctx.daemon)) == 0
   end
 

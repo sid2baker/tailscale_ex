@@ -70,6 +70,30 @@ defmodule TailscaleTest do
     eventually(fn -> assert Tailscale.get(["configuration", "state"]) == :ready end)
   end
 
+  test "public partial updates validate input and preserve unspecified settings", ctx do
+    for {input, reason} <- [
+          {nil, :invalid_configuration},
+          {[hostname: "not-a-map"], :invalid_configuration},
+          {%{auth_key: "private"}, :invalid_configuration},
+          {%{"hostname" => "string-key"}, :invalid_configuration},
+          {%{accept_dns: nil}, :invalid_configuration},
+          {%{hostname: "invalid name"}, :invalid_hostname},
+          {%{advertise_routes: ["invalid"]}, :invalid_route},
+          {%{serve: nil}, :invalid_serve}
+        ] do
+      assert {:error, ^reason} = Tailscale.update_configuration(input)
+    end
+
+    refute Enum.any?(UnixHTTP.state(ctx.daemon).requests, &(&1.method in ["POST", "PATCH"]))
+    assert :ok = Tailscale.configure(%{hostname: "runtime"})
+    UnixHTTP.notify(ctx.daemon, %{"State" => 6})
+    eventually(fn -> assert Tailscale.get(["state"]) == :online end)
+    assert :ok = Tailscale.update_configuration(%{accept_dns: false})
+    assert %{hostname: "runtime", accept_dns: false} = Tailscale.get_configuration()
+    assert :ok = Tailscale.configure(%{})
+    assert %{hostname: "", accept_dns: true} = Tailscale.get_configuration()
+  end
+
   test "auth keys pass directly to LocalAPI without being retained in controller state", ctx do
     key = "tskey-not-a-real-key"
     assert :ok = Tailscale.login(auth_key: key)

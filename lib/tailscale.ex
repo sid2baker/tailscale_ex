@@ -2,7 +2,9 @@ defmodule Tailscale do
   @moduledoc """
   Declarative Tailscale networking for Elixir and Nerves.
 
-  `configure/1` applies managed settings through LocalAPI. The daemon owns persistence.
+  `configure/1` replaces managed settings through LocalAPI; `update_configuration/1`
+  changes selected fields while preserving the others. Both work at runtime.
+  The daemon owns persistence.
   `get/2`, `get_by_prefix/1`, `get_configuration/0`, and subscriptions never perform
   daemon I/O. Startup reads existing settings; only `reset_to_defaults/0` applies
   application `config:` defaults. Subscribe **before** reading an initial value.
@@ -57,6 +59,18 @@ defmodule Tailscale do
   """
   @spec configure(configuration()) :: result()
   def configure(config), do: Controller.configure(Controller, config)
+
+  @doc """
+  Change selected managed settings while running. Omitted fields are preserved;
+  lists are replaced, not appended (`serve: []` removes all managed listeners).
+
+  Reads fresh daemon settings and merges changes inside the Controller, serializing
+  library callers. A failed read returns an error without writing. Validation,
+  apply/readback, and persistence semantics are the same as `configure/1`.
+  External writes and the separate preferences/Serve operations are not transactional.
+  """
+  @spec update_configuration(configuration()) :: result()
+  def update_configuration(changes), do: Controller.update_configuration(Controller, changes)
 
   @doc "Return cached daemon settings, or nil before a successful read or when unreadable."
   @spec get_configuration() :: configuration() | nil

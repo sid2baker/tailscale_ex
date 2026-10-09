@@ -48,6 +48,11 @@ defmodule Tailscale.DaemonIntegrationTest do
     assert {:ok, %{"Hostname" => "tsx-integration", "CorpDNS" => false}, _} =
              LocalAPI.request(ctx.opts, "GET", "prefs")
 
+    assert :ok = Controller.update_configuration(ctx.opts[:controller], %{accept_routes: true})
+
+    assert {:ok, %{"Hostname" => "tsx-integration", "CorpDNS" => false, "RouteAll" => true}, _} =
+             LocalAPI.request(ctx.opts, "GET", "prefs")
+
     # Restarting the controller rehydrates from the still-running daemon, not defaults.
     assert :ok = Supervisor.terminate_child(ctx.opts[:supervisor], Controller)
     PropertyTable.delete(ctx.table, ["configuration", "value"])
