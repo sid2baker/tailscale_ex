@@ -36,12 +36,10 @@ defmodule Tailscale.DaemonIntegrationTest do
   test "real daemon owns preferences, including memory-only preferences before enrollment", ctx do
     assert PropertyTable.get(ctx.table, ["state"]) == :offline
     assert configuration(ctx).hostname == ""
+    assert configuration(ctx).accept_dns
 
     assert :ok =
-             Controller.configure(ctx.opts[:controller], %{
-               hostname: "tsx-integration",
-               accept_dns: false
-             })
+             Controller.configure(ctx.opts[:controller], %{hostname: "tsx-integration"})
 
     assert configuration(ctx).hostname == "tsx-integration"
 
@@ -90,8 +88,11 @@ defmodule Tailscale.DaemonIntegrationTest do
 
     # tailscaled does not persist prefs until enrollment creates a saved profile.
     # The library reports that reality rather than secretly reapplying configuration.
-    assert {:ok, %{"Hostname" => ""}, _} = LocalAPI.request(ctx.opts, "GET", "prefs")
+    assert {:ok, %{"Hostname" => "", "CorpDNS" => true}, _} =
+             LocalAPI.request(ctx.opts, "GET", "prefs")
+
     assert configuration(ctx).hostname == ""
+    assert configuration(ctx).accept_dns
     PropertyTable.unsubscribe(ctx.table, ["state"])
     stop_supervised(Tailscale.Supervisor)
     start_supervised!({Fixture, ctx.opts})

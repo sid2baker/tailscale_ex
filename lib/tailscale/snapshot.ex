@@ -89,6 +89,14 @@ defmodule Tailscale.Snapshot do
   end
 
   defp state_change(snapshot, notification) do
+    # Profile resets emit NoState without an empty SelfChange or peer removals.
+    snapshot =
+      if notification["State"] in [0, "NoState"] do
+        %{snapshot | self: %{}, peers: %{}}
+      else
+        snapshot
+      end
+
     backend =
       if is_nil(notification["State"]), do: snapshot.backend, else: backend(notification["State"])
 

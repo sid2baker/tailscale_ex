@@ -7,7 +7,7 @@ defmodule Tailscale.Configuration do
 
   @defaults %{
     hostname: "",
-    accept_dns: true,
+    accept_dns: false,
     accept_routes: false,
     ssh: false,
     advertise_routes: [],

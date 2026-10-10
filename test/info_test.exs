@@ -63,6 +63,26 @@ defmodule Tailscale.InfoTest do
     assert names == Enum.map(1..75, &("peer-" <> String.pad_leading(to_string(&1), 3, "0")))
   end
 
+  test "health URL redaction survives expiry and replacement, before escaping text" do
+    old_url = "https://login.tailscale.com/a/old-secret"
+
+    for current_url <- [nil, "https://login.tailscale.com/a/new-secret"] do
+      report =
+        Info.format(%{
+          ["auth", "url"] => current_url,
+          ["health"] => [
+            "Log in: #{old_url}",
+            "Custom login: https://control.example/a/\"secret\""
+          ]
+        })
+
+      refute report =~ "secret"
+      refute report =~ "https://"
+      assert report =~ "Log in: [redacted]"
+      assert report =~ "Custom login: [redacted]"
+    end
+  end
+
   test "missing data is readable and login URLs never appear, including in health text" do
     url = "https://login.tailscale.com/a/secret"
 

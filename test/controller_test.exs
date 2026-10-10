@@ -10,7 +10,7 @@ defmodule Tailscale.ControllerTest do
     opts =
       Fixture.options(__MODULE__, UnixHTTP.socket(daemon),
         auth_url_ttl: 80,
-        config: %{hostname: "app-default", accept_dns: false}
+        config: %{hostname: "app-default", accept_dns: true}
       )
 
     start_supervised!({Fixture, opts})
@@ -28,15 +28,18 @@ defmodule Tailscale.ControllerTest do
     assert configuration(ctx).hostname == ""
     assert configuration(ctx).accept_dns
     assert writes(UnixHTTP.state(ctx.daemon)) == 0
+    assert :ok = Controller.update_configuration(ctx.controller, %{accept_dns: false})
+    refute configuration(ctx).accept_dns
     assert :ok = Controller.reset(ctx.controller)
     assert configuration(ctx).hostname == "app-default"
-    refute configuration(ctx).accept_dns
+    assert configuration(ctx).accept_dns
     assert UnixHTTP.state(ctx.daemon).prefs["Unmanaged"] == "kept"
   end
 
   test "configuration replacement, removal, and idempotent readback", ctx do
     dns(ctx)
     config = %{hostname: "nerves", ssh: true, serve: [%{https: 443, to: "http://127.0.0.1"}]}
+    assert :ok = Controller.update_configuration(ctx.controller, %{hostname: "nerves"})
     assert :ok = Controller.configure(ctx.controller, config)
     assert configuration(ctx).hostname == "nerves"
     assert configuration(ctx).serve == config.serve
@@ -48,6 +51,7 @@ defmodule Tailscale.ControllerTest do
     assert :ok = Controller.configure(ctx.controller, %{})
     assert UnixHTTP.state(ctx.daemon).serve["TCP"] == %{}
     assert UnixHTTP.state(ctx.daemon).prefs["RunSSH"] == false
+    assert UnixHTTP.state(ctx.daemon).prefs["CorpDNS"] == false
     assert configuration(ctx).serve == []
   end
 
@@ -68,13 +72,14 @@ defmodule Tailscale.ControllerTest do
 
     original = %{
       hostname: "existing",
-      accept_dns: false,
+      accept_dns: true,
       accept_routes: true,
       ssh: true,
       advertise_routes: ["10.0.0.0/24"],
       serve: [%{https: 443, to: "http://localhost:4000"}]
     }
 
+    assert :ok = Controller.update_configuration(ctx.controller, %{hostname: "existing"})
     assert :ok = Controller.configure(ctx.controller, original)
 
     changes = %{
@@ -97,7 +102,7 @@ defmodule Tailscale.ControllerTest do
     assert configuration(ctx).advertise_routes == []
     assert configuration(ctx).hostname == "existing"
     assert configuration(ctx).accept_routes
-    refute configuration(ctx).accept_dns
+    assert configuration(ctx).accept_dns
     refute configuration(ctx).ssh
 
     before = writes(UnixHTTP.state(ctx.daemon))
@@ -114,7 +119,7 @@ defmodule Tailscale.ControllerTest do
     UnixHTTP.update(ctx.daemon, fn state ->
       %{
         state
-        | prefs: Map.put(state.prefs, "Hostname", "external.example"),
+        | prefs: Map.merge(state.prefs, %{"Hostname" => "external.example", "CorpDNS" => true}),
           serve: serve,
           etag: 2
       }
@@ -202,11 +207,11 @@ defmodule Tailscale.ControllerTest do
 
     assert {:error, :preferences_readback_mismatch} =
              Controller.configure(ctx.controller, %{
-               hostname: "ignored",
+               ssh: true,
                serve: [%{https: 443, to: "http://localhost:4000"}]
              })
 
-    assert configuration(ctx).hostname == ""
+    refute configuration(ctx).ssh
     assert configuration(ctx).serve == []
     assert UnixHTTP.state(ctx.daemon).serve == nil
 
@@ -271,6 +276,34 @@ defmodule Tailscale.ControllerTest do
     assert writes(UnixHTTP.state(ctx.daemon)) == count
   end
 
+  test "hostname changes and nonempty Serve must be separate, before any writes", ctx do
+    dns(ctx)
+    endpoints = [%{https: 443, to: "http://localhost:4000"}]
+
+    for command <- [&Controller.configure/2, &Controller.update_configuration/2] do
+      assert {:error, :hostname_change_requires_separate_serve} =
+               command.(ctx.controller, %{hostname: "renamed", ssh: true, serve: endpoints})
+    end
+
+    assert writes(UnixHTTP.state(ctx.daemon)) == 0
+    assert configuration(ctx).hostname == ""
+    refute configuration(ctx).ssh
+
+    assert :ok = Controller.update_configuration(ctx.controller, %{hostname: "renamed"})
+
+    UnixHTTP.notify(ctx.daemon, %{
+      "SelfChange" => %{"ID" => 1, "Name" => "renamed.ts.net."}
+    })
+
+    eventually(fn -> assert PropertyTable.get(ctx.table, ["dns_name"]) == "renamed.ts.net" end)
+
+    # Including an unchanged hostname is safe, as is renaming while removing Serve.
+    assert :ok = Controller.configure(ctx.controller, %{hostname: "renamed", serve: endpoints})
+    assert Map.keys(UnixHTTP.state(ctx.daemon).serve["Web"]) == ["renamed.ts.net:443"]
+    assert :ok = Controller.update_configuration(ctx.controller, %{hostname: "again", serve: []})
+    assert configuration(ctx).serve == []
+  end
+
   test "Serve without DNS fails immediately and is not applied after login", ctx do
     config = %{serve: [%{https: 443, to: "http://localhost:80"}]}
     assert {:error, :awaiting_dns_name} = Controller.configure(ctx.controller, config)
@@ -286,9 +319,9 @@ defmodule Tailscale.ControllerTest do
   test "partial changes are observed and Serve CAS conflicts require an explicit retry", ctx do
     dns(ctx)
     UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"POST", "/localapi/v0/serve-config"}], 412))
-    config = %{hostname: "partial", serve: [%{https: 443, to: "http://localhost"}]}
+    config = %{ssh: true, serve: [%{https: 443, to: "http://localhost"}]}
     assert {:error, {:http, 412}} = Controller.configure(ctx.controller, config)
-    assert configuration(ctx).hostname == "partial"
+    assert configuration(ctx).ssh
     assert configuration(ctx).serve == []
     count = writes(UnixHTTP.state(ctx.daemon))
     UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}, etag: 9})
@@ -333,6 +366,7 @@ defmodule Tailscale.ControllerTest do
     UnixHTTP.update(ctx.daemon, &put_in(&1.prefs["Hostname"], "existing"))
     assert :ok = Controller.login(ctx.controller, :interactive)
     assert UnixHTTP.state(ctx.daemon).prefs["Hostname"] == "existing"
+    assert UnixHTTP.state(ctx.daemon).prefs["CorpDNS"] == true
     paths = Enum.map(UnixHTTP.state(ctx.daemon).requests, & &1.path)
     assert hd(paths) =~ "watch-ipn-bus"
     assert "/localapi/v0/start" in paths
@@ -356,6 +390,7 @@ defmodule Tailscale.ControllerTest do
 
   test "auth-key is sent via Start and activates a new profile without being retained", ctx do
     assert :ok = Controller.login(ctx.controller, {:auth_key, "tskey-not-a-real-key"})
+    assert UnixHTTP.state(ctx.daemon).prefs["CorpDNS"] == true
     requests = UnixHTTP.state(ctx.daemon).requests
 
     assert Enum.any?(
@@ -386,7 +421,7 @@ defmodule Tailscale.ControllerTest do
     dns(ctx)
     :sys.get_state(ctx.controller)
     before = length(UnixHTTP.state(ctx.daemon).requests)
-    config = %{hostname: "verified", serve: [%{https: 443, to: "http://localhost:4000"}]}
+    config = %{ssh: true, serve: [%{https: 443, to: "http://localhost:4000"}]}
     assert :ok = Controller.configure(ctx.controller, config)
     requests = Enum.drop(UnixHTTP.state(ctx.daemon).requests, before)
 
@@ -399,7 +434,7 @@ defmodule Tailscale.ControllerTest do
              {"GET", "/localapi/v0/serve-config"}
            ]
 
-    assert configuration(ctx).hostname == config.hostname
+    assert configuration(ctx).ssh == config.ssh
     assert configuration(ctx).serve == config.serve
   end
 

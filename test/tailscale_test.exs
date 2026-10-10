@@ -70,10 +70,10 @@ defmodule TailscaleTest do
       assert {:error, :invalid_options} = Tailscale.login(timeout: timeout)
     end
 
-    assert :ok = Tailscale.configure(%{hostname: "new"})
-    assert Tailscale.get_configuration().hostname == "new"
+    assert :ok = Tailscale.configure(%{hostname: "new", accept_dns: true})
+    assert %{hostname: "new", accept_dns: true} = Tailscale.get_configuration()
     assert :ok = Tailscale.reset_to_defaults()
-    assert Tailscale.get_configuration().hostname == ""
+    assert %{hostname: "", accept_dns: false} = Tailscale.get_configuration()
     eventually(fn -> assert Tailscale.get(["configuration", "state"]) == :ready end)
   end
 
@@ -95,10 +95,10 @@ defmodule TailscaleTest do
     assert :ok = Tailscale.configure(%{hostname: "runtime"})
     UnixHTTP.notify(ctx.daemon, %{"State" => 6})
     eventually(fn -> assert Tailscale.get(["state"]) == :online end)
-    assert :ok = Tailscale.update_configuration(%{accept_dns: false})
-    assert %{hostname: "runtime", accept_dns: false} = Tailscale.get_configuration()
+    assert :ok = Tailscale.update_configuration(%{accept_dns: true})
+    assert %{hostname: "runtime", accept_dns: true} = Tailscale.get_configuration()
     assert :ok = Tailscale.configure(%{})
-    assert %{hostname: "", accept_dns: true} = Tailscale.get_configuration()
+    assert %{hostname: "", accept_dns: false} = Tailscale.get_configuration()
   end
 
   test "browser login returns the delayed URL without touching caller subscriptions", ctx do

@@ -76,7 +76,17 @@ defmodule Tailscale.Info do
   end
 
   defp health([]), do: nil
-  defp health(warnings), do: ["  Health warnings:" | Enum.map(warnings, &("    " <> value(&1)))]
+
+  # Health text can outlive or precede the corresponding enrollment URL.
+  defp health(warnings) do
+    [
+      "  Health warnings:"
+      | Enum.map(warnings, fn warning ->
+          "    " <> value(String.replace(warning, ~r/https?:\/\/\S+/i, "[redacted]"))
+        end)
+    ]
+  end
+
   defp error(_label, nil), do: nil
   defp error(label, reason), do: "  #{label} error: #{value(reason)}"
   defp connection(true), do: "connected"

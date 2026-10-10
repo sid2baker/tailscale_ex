@@ -163,6 +163,16 @@ defmodule Tailscale.Monitor do
 
   def handle_event(:info, _message, _phase, _data), do: :keep_state_and_data
 
+  # OTP diagnostics must not expose enrollment URLs or raw daemon notifications.
+  @impl true
+  def format_status(status) do
+    Map.new(status, fn
+      {:state, phase} -> {:state, phase}
+      {key, _value} when key in [:queue, :postponed, :timeouts, :log] -> {key, []}
+      {key, _value} -> {key, :redacted}
+    end)
+  end
+
   @impl true
   def terminate(_reason, _phase, data) do
     if data.worker, do: Process.exit(data.worker, :kill)

@@ -11,7 +11,19 @@ defmodule Tailscale.ConfigurationTest do
 
     assert config.hostname == "nerves-livebook"
     assert config.advertise_routes == ["10.1.0.0/16", "2001:db8::/64"]
+    refute config.accept_dns
+  end
+
+  test "DNS management is opt-in and defaults disable an existing opt-in" do
+    assert {:ok, defaults} = Configuration.normalize(%{})
+    assert {:ok, config} = Configuration.normalize(%{accept_dns: true})
     assert config.accept_dns
+    assert Configuration.observed(Configuration.preferences(config), []).accept_dns
+
+    assert Configuration.patch(defaults, Configuration.preferences(config)) == %{
+             "CorpDNS" => false,
+             "CorpDNSSet" => true
+           }
   end
 
   test "rejects unsupported fields, credentials and malformed settings without including values" do

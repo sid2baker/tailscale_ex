@@ -4,14 +4,98 @@ defmodule Tailscale do
 
   The daemon owns configuration, identity, authentication, and persistence.
   This library manages its lifecycle, issues commands, and caches observations.
-  `configure/1` replaces managed settings; `update_configuration/1` changes only
-  the supplied fields. Commands wait briefly for the observer to become ready;
-  callers do not need to coordinate startup.
-  `get/2`, `get_by_prefix/1`, `get_configuration/0`, and subscriptions never perform
-  daemon I/O. Startup reads existing settings; only `reset_to_defaults/0` applies
-  application `config:` defaults. Subscribe **before** reading an initial value.
+  The OTP application starts automatically; do not add it to your supervision tree.
+  Commands wait for the observer's initial snapshot, returning an error if unavailable.
+  Cache reads and subscriptions never perform daemon I/O.
+
+  ## Application options
+
+  Set these with `config :tailscale, option: value`. They are read at application
+  startup; change running daemon settings with `update_configuration/1` instead.
+
+  | Option | Default | Purpose |
+  | --- | --- | --- |
+  | `:manage_daemon` | `true` | Start and supervise a daemon; `false` attaches to an existing one. |
+  | `:daemon_path` | `"tailscaled"` | Executable name on PATH or path on the running device. |
+  | `:tun` | `:kernel` | `:kernel` uses `tailscale0`; `:userspace` needs no TUN; a string names a TUN interface. |
+  | `:data_dir` | See below | Base directory for managed daemon storage. |
+  | `:state_dir` | `<data_dir>/identity` | Daemon identity and profile storage. |
+  | `:socket` | See below | LocalAPI Unix socket. |
+  | `:port` | `0` | Managed daemon UDP port; `0` chooses automatically. |
+  | `:config` | `%{}` | Managed defaults for `reset_to_defaults/0`, never applied at startup. |
+  | `:timeout` | `5_000` | LocalAPI request and command readiness timeouts, in milliseconds. |
+  | `:initial_timeout` | `10_000` | Milliseconds to receive an initial watch snapshot. |
+  | `:retry_min`, `:retry_max` | `200`, `30_000` | Backoff bounds in milliseconds for restarts, reconnects, and failed reads. |
+  | `:auth_url_ttl` | `600_000` | Maximum cached login URL lifetime in milliseconds. |
+  | `:max_body`, `:max_frame` | `4_194_304` each | Byte limits for HTTP response bodies and watch frames. |
+
+  `data_dir` defaults to `/data/tailscale_ex` when Nerves.Runtime is available,
+  otherwise `~/.local/share/tailscale_ex`. Use durable writable storage for identity.
+  The managed socket defaults to `<data_dir>/run/tailscaled.sock`.
+
+  To attach to an existing daemon:
+
+      config :tailscale,
+        manage_daemon: false,
+        socket: "/var/run/tailscale/tailscaled.sock"
+
+  This is also the default socket in external mode. The application needs permission
+  to use it; commands change that daemon's settings. Launch options such as `:tun`,
+  `:daemon_path`, and `:state_dir` do not reconfigure an external daemon.
+
+  Userspace mode supports Serve without root or a TUN device, but creates no
+  host-wide interface. Kernel mode requires TUN support and OS permissions;
+  kernel subnet routing also needs IP forwarding. Userspace subnet routing has
+  protocol limitations. Advertising routes still requires tailnet route approval.
+  Tailscale SSH needs tailnet SSH policy, local OS accounts, and permission to start
+  their sessions; it is not restricted to kernel mode. See Tailscale's
+  [routing modes](https://tailscale.com/kb/1177/kernel-vs-userspace-routers) and
+  [SSH setup](https://tailscale.com/kb/1193/tailscale-ssh) for prerequisites.
+
+  Tailscale 1.102.3 is the tested protocol baseline. The observer accepts 1.102.3+
+  within 1.x, but later versions still need compatibility testing.
+
+  ## Managed settings
+
+  Both configuration APIs accept an atom-keyed map of these fields only:
+
+  | Field | Library default | Values |
+  | --- | --- | --- |
+  | `:hostname` | `""` | DNS label up to 63 characters, normalized to lowercase; empty uses the daemon's default hostname. |
+  | `:accept_dns` | `false` | Whether to accept tailnet DNS configuration; opt in with `true`. |
+  | `:accept_routes` | `false` | Whether to accept advertised subnet routes. |
+  | `:ssh` | `false` | Whether to enable Tailscale SSH. |
+  | `:advertise_routes` | `[]` | CIDR strings or `{ip_tuple, prefix_length}`; normalized to sorted, unique network CIDRs. |
+  | `:serve` | `[]` | `[%{https: port, to: "http://127.0.0.1:4000"}]`; unique ports in `1..65535`, HTTP(S) targets without userinfo or fragments. |
+
+  DNS management is opt-in: `accept_dns: false` leaves it to the device's network
+  stack and avoids `/etc/resolv.conf` write errors on read-only Nerves filesystems.
+  This does not disable tailnet connectivity or inbound Serve, but does not configure
+  the device to resolve other peers' MagicDNS names.
+
+  `configure/1` replaces all of these fields; `update_configuration/1` preserves
+  omitted fields. Startup only reads settings, and login does not apply these defaults.
+  `reset_to_defaults/0` explicitly applies `:config` with library defaults for its
+  omitted fields. A fresh or existing daemon may still have DNS enabled; use
+  `update_configuration(%{accept_dns: false})` to disable it without resetting other
+  settings.
+
+  Setting `:serve` replaces all top-level TCP/Web listeners and disables Funnel,
+  including settings made outside this library. Separate Tailscale Services are
+  preserved; active foreground Serve configurations cause an error. Each endpoint
+  proxies `/` over HTTPS on the observed tailnet DNS name. Enable MagicDNS and HTTPS
+  in the tailnet first. This does not replace the upstream app's authentication.
+
+  Writes are serialized between library callers and verified by readback, not
+  automatically retried. Preferences and Serve are separate operations and may
+  partially apply. Concurrent external changes can cause a conflict; inspect
+  `get_configuration/0` before deciding whether to retry. Settings made before
+  enrollment can be lost on daemon restart.
 
   ## Properties
+
+  Subscribe **before** reading an initial value. Properties are cached observations,
+  not a live connectivity check. Runtime properties are never persisted.
 
   * `["state"]`: `:unavailable | :offline | :online`. Online means backend Running;
     unavailable means the observer cannot determine connectivity.
@@ -21,21 +105,26 @@ defmodule Tailscale do
   * `["hostname"]`, `["dns_name"]`: self host and tailnet DNS names.
   * `["auth", "state"]`: `:unknown | :needs_login | :authenticating |
     :needs_approval | :authenticated | :stopped | :error`.
-  * `["auth", "url"]`: transient HTTPS enrollment URL, absent when obsolete.
+  * `["auth", "url"]`: secret HTTPS enrollment URL, removed on completion, error,
+    disconnect, or cache expiry. `:auth_url_ttl` does not extend the server's URL validity.
   * `["auth", "error"]`: sanitized failure category, absent on success.
   * `["peers", id, field]`: stable node ID (numeric fallback), with `"hostname"`,
     `"dns_name"`, `"ipv4"`, `"ipv6"`, and `"online"` fields. Missing values are absent.
-  * `["health"]`: list of daemon health warning strings.
+  * `["health"]`: raw daemon health warning strings; these can contain login URLs.
+    `info/0` redacts HTTP(S) URLs when displaying them.
   * `["configuration", "value"]`: cached managed configuration, absent when preferences
     are unreadable. The `:serve` field is omitted when Serve cannot be read or represented.
   * `["configuration", "state"]`: `:ready | :applying | :error` (latest operation/read).
   * `["configuration", "error"]`: sanitized failure reason, absent on a successful read.
   * `["monitor", "connected"]`, `["monitor", "generation"]`, `["monitor", "error"]`:
     stream diagnostics. `["version"]` is the daemon version.
-  * `["daemon", "state"]`: `:external | :running | :restarting`.
+  * `["daemon", "state"]`: `:external | :running | :restarting`; process status,
+    not tailnet connectivity.
 
-  Runtime properties are never persisted. See the README for daemon installation,
-  writable storage, managed-setting ownership, and the Tailscale protocol baseline.
+  Disconnects and profile resets clear cached identity and peers. A stopped backend
+  can retain assigned addresses; use `["state"]`, not an address, to check online status.
+  Treat login URLs and raw health text as sensitive, including subscription messages.
+  See the README for installation and a quick start.
   """
 
   alias Tailscale.Controller
@@ -59,6 +148,11 @@ defmodule Tailscale do
   transaction: an error can leave partial changes.
   Persistence follows the daemon's profile lifecycle (unenrolled profiles are memory-only).
   Authentication keys and unknown fields are rejected.
+
+  Changing hostname and setting nonempty Serve in the same call is rejected before
+  writes (`:hostname_change_requires_separate_serve`). Rename first, wait for the new
+  `["dns_name"]`, then explicitly reapply Serve; existing listeners are not automatically
+  rebound when the hostname changes.
   """
   @spec configure(configuration()) :: result()
   def configure(config), do: Controller.configure(Controller, config)
@@ -85,7 +179,13 @@ defmodule Tailscale do
   @spec get_configuration() :: configuration() | nil
   def get_configuration, do: get(["configuration", "value"])
 
-  @doc "Explicitly apply the application's `config:` defaults to the daemon."
+  @doc """
+  Apply the `:config` map read at application startup, filling omitted fields with
+  library defaults. For example, `config :tailscale, config: %{accept_dns: true}`
+  makes an explicit reset enable Tailscale DNS management and reset all other managed fields.
+  With no `:config`, this is equivalent to `configure(%{})`. It does not log out
+  or delete identity. The validation and partial-write semantics of `configure/1` apply.
+  """
   @spec reset_to_defaults() :: result()
   def reset_to_defaults, do: Controller.reset(Controller)
 
@@ -99,6 +199,8 @@ defmodule Tailscale do
 
   @doc """
   Subscribe the calling process to a prefix/wildcard, before reading its initial value.
+  No initial snapshot is sent. For example, `["auth"]` matches all auth properties,
+  and `["peers", :_, "online"]` matches each peer's online status.
   Messages are `{Tailscale, path, old, new, %{old_timestamp: old_ts, new_timestamp: ts}}`.
   Timestamps use native monotonic time units; deleted values are `nil`.
   """
@@ -115,9 +217,15 @@ defmodule Tailscale do
   completion. Override this URL wait with `timeout: milliseconds`. A timeout
   does not cancel enrollment; call again after an interruption or URL expiration.
 
-  With `auth_key: key`, returns `:ok` after initiating unattended enrollment.
-  Observe `["state"]` or `["auth"]` for completion. Machine approval is reported
-  as `{:error, :needs_approval}` for browser login. Credentials are not persisted or logged.
+  With `auth_key: key`, returns `:ok` after initiating unattended enrollment, not
+  confirmation that the key was accepted. Read `["state"]` or `["auth", "state"]`,
+  or subscribe to `["auth"]`, for completion and failures. Machine approval is
+  reported as `{:error, :needs_approval}` for browser login.
+
+  Use either `timeout: milliseconds` or `auth_key: key`, not both. The URL timeout
+  starts after login initiation; it is not an overall command deadline. The library
+  does not persist keys or login URLs; the daemon stores the enrolled identity.
+  Keep keys out of application configuration and treat login URLs as secrets.
   """
   @spec login(keyword()) :: result() | {:ok, String.t()}
   def login(opts \\ [])
@@ -141,7 +249,11 @@ defmodule Tailscale do
   @spec logout() :: result()
   def logout, do: Controller.logout(Controller)
 
-  @doc "Print a readable cached status report, without login URLs or daemon I/O."
+  @doc """
+  Print cached status, configuration, and peers without daemon I/O.
+  Omits the auth URL and redacts all HTTP(S) URLs in health warnings, including
+  expired login URLs. Raw properties and subscription messages are not redacted.
+  """
   @spec info() :: :ok
   def info, do: Tailscale.Info.print()
 end

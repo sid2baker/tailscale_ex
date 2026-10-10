@@ -201,7 +201,18 @@ defmodule Tailscale.Controller do
   defp preferences(opts, config) do
     with {:ok, current} <- read_preferences(opts) do
       patch = Configuration.patch(config, current)
-      if map_size(patch) == 0, do: {:ok, current}, else: apply_preferences(opts, config, patch)
+
+      # A rename's DNS update is asynchronous; never bind Serve to the old name.
+      cond do
+        Map.has_key?(patch, "HostnameSet") and Map.get(config, :serve, []) != [] ->
+          {:error, :hostname_change_requires_separate_serve}
+
+        map_size(patch) == 0 ->
+          {:ok, current}
+
+        true ->
+          apply_preferences(opts, config, patch)
+      end
     end
   end
 

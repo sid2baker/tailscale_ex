@@ -1,6 +1,7 @@
 defmodule Tailscale.MonitorTest do
   use ExUnit.Case, async: true
   import Tailscale.Test.Fixture, only: [eventually: 1]
+  import ExUnit.CaptureLog
   alias Tailscale.{Monitor, Snapshot}
   alias Tailscale.Test.{Fixture, UnixHTTP}
 
@@ -119,6 +120,62 @@ defmodule Tailscale.MonitorTest do
     eventually(fn ->
       assert PropertyTable.get(ctx.table, ["auth", "error"]) == :authentication_failed
     end)
+  end
+
+  test "OTP status and crash reports redact auth state and raw notifications", ctx do
+    url = "https://login.tailscale.com/a/crash-secret"
+    secret = "tskey-reflected-in-error"
+    assert :ok = Monitor.auth(ctx.monitor, {:url, url})
+    refute inspect(:sys.get_status(ctx.monitor), limit: :infinity) =~ url
+    :ok = :sys.log(ctx.monitor, true)
+    assert :ok = Monitor.auth(ctx.monitor, {:url, url})
+    pid = Process.whereis(ctx.monitor)
+    ref = Process.monitor(pid)
+
+    log =
+      capture_log(fn ->
+        UnixHTTP.notify(ctx.daemon, %{
+          "Health" => %{"Warnings" => %{"malformed" => 1}},
+          "ErrMessage" => secret
+        })
+
+        assert_receive {:DOWN, ^ref, :process, _, _}, 1_000
+      end)
+
+    assert log =~ "terminating"
+    refute log =~ url
+    refute log =~ secret
+    refute log =~ "format_status"
+    eventually(fn -> assert Process.whereis(ctx.monitor) not in [nil, pid] end)
+    assert :ok = Monitor.ready(ctx.monitor)
+  end
+
+  test "profile resets clear identity and peers, while stopping retains them" do
+    initial =
+      Snapshot.update(%Snapshot{}, %{
+        "InitialStatus" => %{
+          "BackendState" => "Running",
+          "Self" => %{"ID" => "self", "DNSName" => "old.ts.net.", "TailscaleIPs" => ["100.1.2.3"]},
+          "Peer" => %{"pubkey" => %{"NodeID" => 10, "ID" => "n10", "Online" => true}}
+        }
+      })
+
+    stopped = Snapshot.update(initial, %{"State" => 4})
+    assert stopped.self == initial.self
+    assert stopped.peers == initial.peers
+
+    for reset <- [0, "NoState"] do
+      snapshot =
+        initial |> Snapshot.update(%{"State" => reset}) |> Snapshot.update(%{"State" => 2})
+
+      assert snapshot.backend == :needs_login
+      assert snapshot.self == %{}
+      assert snapshot.peers == %{}
+      properties = Snapshot.properties(snapshot)
+      refute Map.has_key?(properties, ["ipv4"])
+      refute Map.has_key?(properties, ["dns_name"])
+      refute Map.has_key?(properties, ["peers", "n10", "online"])
+    end
   end
 
   test "login waiters have independent deadlines and are cleared on completion", ctx do
