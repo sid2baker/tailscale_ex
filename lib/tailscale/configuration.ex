@@ -3,6 +3,8 @@ defmodule Tailscale.Configuration do
 
   import Bitwise
 
+  alias Tailscale.Serve
+
   @defaults %{
     hostname: "",
     accept_dns: true,
@@ -23,7 +25,7 @@ defmodule Tailscale.Configuration do
     with true <- Enum.all?(Map.keys(config), &Map.has_key?(@defaults, &1)),
          {:ok, hostname} <- hostname(Map.get(config, :hostname, "")),
          {:ok, routes} <- routes(Map.get(config, :advertise_routes, [])),
-         {:ok, serve} <- serve(Map.get(config, :serve, [])),
+         {:ok, serve} <- Serve.normalize(Map.get(config, :serve, [])),
          true <-
            Enum.all?(
              [:accept_dns, :accept_routes, :ssh],
@@ -43,10 +45,12 @@ defmodule Tailscale.Configuration do
   def observed(prefs, serve) do
     Map.new(@fields, fn {key, field} -> {key, Map.get(prefs, field, @defaults[key])} end)
     |> Map.update!(:advertise_routes, &Enum.sort(&1 || []))
-    |> Map.put(:serve, serve)
+    |> Map.merge(if is_nil(serve), do: %{}, else: %{serve: serve})
   end
 
-  def preferences(config), do: Map.new(@fields, fn {key, field} -> {field, config[key]} end)
+  def preferences(config) do
+    config |> Map.take(Map.keys(@fields)) |> Map.new(fn {key, value} -> {@fields[key], value} end)
+  end
 
   def patch(config, current) do
     config
@@ -116,40 +120,4 @@ defmodule Tailscale.Configuration do
   end
 
   defp route(_), do: {:error, :invalid_route}
-
-  defp serve(entries) when is_list(entries) do
-    Enum.reduce_while(entries, {:ok, []}, fn entry, {:ok, acc} ->
-      case endpoint(entry) do
-        {:ok, value} -> {:cont, {:ok, [value | acc]}}
-        error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, entries} ->
-        if length(Enum.uniq_by(entries, & &1.https)) == length(entries),
-          do: {:ok, Enum.sort_by(entries, & &1.https)},
-          else: {:error, :duplicate_serve_port}
-
-      error ->
-        error
-    end
-  end
-
-  defp serve(_), do: {:error, :invalid_serve}
-
-  defp endpoint(%{https: port, to: to} = entry)
-       when map_size(entry) == 2 and is_integer(port) and port in 1..65_535 and is_binary(to) do
-    case URI.new(to) do
-      {:ok,
-       %URI{scheme: scheme, host: host, userinfo: nil, fragment: nil, port: target_port} = uri}
-      when scheme in ["http", "https"] and is_binary(host) and host != "" and
-             target_port in 1..65_535 ->
-        {:ok, %{https: port, to: URI.to_string(%{uri | host: String.downcase(host)})}}
-
-      _ ->
-        {:error, :invalid_serve_target}
-    end
-  end
-
-  defp endpoint(_), do: {:error, :invalid_serve}
 end

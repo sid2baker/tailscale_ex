@@ -67,7 +67,7 @@ defmodule Tailscale.DaemonIntegrationTest do
     assert {:error, :awaiting_dns_name} =
              Tailscale.Serve.reconcile(ctx.opts, [%{https: 443, to: "http://127.0.0.1:80"}], nil)
 
-    assert :ok = Tailscale.Serve.reconcile(ctx.opts, [], nil)
+    assert {:ok, []} = Tailscale.Serve.reconcile(ctx.opts, [], nil)
 
     identity = Path.join(ctx.directory, "identity")
     File.write!(Path.join(identity, "preserve-marker"), "identity storage must survive")
@@ -109,7 +109,8 @@ defmodule Tailscale.DaemonIntegrationTest do
   test "real browser enrollment emits a URL and preserves the generated machine identity on restart",
        ctx do
     assert :ok = Controller.login(ctx.opts[:controller], :interactive)
-    eventually(fn -> assert is_binary(PropertyTable.get(ctx.table, ["auth", "url"])) end, 2_000)
+    assert {:ok, url} = Monitor.await_login(ctx.opts[:monitor], 40_000)
+    assert String.starts_with?(url, "https://")
     assert PropertyTable.get(ctx.table, ["auth", "state"]) == :authenticating
     path = Path.join(ctx.directory, "identity/tailscaled.state")
     fingerprint = machine_fingerprint(path)

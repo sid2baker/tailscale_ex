@@ -1,28 +1,38 @@
 defmodule Tailscale.Monitor do
   @moduledoc false
-  use GenServer
+  @behaviour :gen_statem
 
   alias Tailscale.{LocalAPI, Snapshot}
 
+  def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
+
   def start_link(opts),
-    do: GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :monitor))
+    do: :gen_statem.start_link({:local, Keyword.fetch!(opts, :monitor)}, __MODULE__, opts, [])
 
   def ready(server, timeout \\ 5_000),
-    do: GenServer.call(server, {:ready, timeout}, timeout + 1_000)
+    do: :gen_statem.call(server, {:ready, timeout}, timeout + 1_000)
 
-  def auth(server, event), do: GenServer.call(server, {:auth, event})
+  def auth(server, event), do: :gen_statem.call(server, {:auth, event}, 5_000)
+
+  def await_login(server, timeout),
+    do: :gen_statem.call(server, {:await_login, timeout}, :infinity)
+
+  # backoff -> connecting -> ready; failures return to backoff.
+  # These are observer states, not tailscaled's backend/authentication states.
+  @impl true
+  def callback_mode, do: :handle_event_function
 
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
     table = Keyword.fetch!(opts, :table)
 
-    state = %{
+    data = %{
       opts: opts,
       table: table,
       worker: nil,
-      ready: false,
       waiters: %{},
+      login_waiters: %{},
       snapshot: %Snapshot{},
       published:
         table
@@ -30,154 +40,187 @@ defmodule Tailscale.Monitor do
         |> Enum.reject(fn {path, _} -> hd(path) in ["configuration", "daemon", "monitor"] end)
         |> Map.new(),
       delay: Keyword.get(opts, :retry_min, 200),
-      timer: nil,
-      initial_timer: nil,
-      url_timer: nil,
       generation: 0
     }
 
     # PropertyTable can outlive a crashed monitor; never leave its old snapshot online.
-    state = unavailable(state, :connecting)
-    send(self(), :connect)
-    {:ok, state}
+    {data, actions} = unavailable(data, :connecting)
+    {:ok, :backoff, data, [{:next_event, :internal, :connect} | actions]}
   end
 
   @impl true
-  def handle_call({:ready, _timeout}, _from, %{ready: true} = state), do: {:reply, :ok, state}
+  def handle_event({:call, from}, {:ready, _timeout}, :ready, _data),
+    do: {:keep_state_and_data, [{:reply, from, :ok}]}
 
-  def handle_call({:ready, timeout}, from, state) do
+  def handle_event({:call, from}, {:ready, timeout}, _phase, data) do
     ref = make_ref()
-    timer = Process.send_after(self(), {:ready_timeout, ref}, timeout)
-    {:noreply, %{state | waiters: Map.put(state.waiters, ref, {from, timer})}}
+    data = %{data | waiters: Map.put(data.waiters, ref, from)}
+    {:keep_state, data, [{{:timeout, {:ready, ref}}, timeout, :expired}]}
   end
 
-  def handle_call({:notification, worker, notification}, _from, %{worker: worker} = state) do
-    if supported?(notification["Version"]) do
-      snapshot = Snapshot.update(state.snapshot, notification)
-      initial = is_map(notification["InitialStatus"])
-      state = %{state | snapshot: snapshot}
-      state = if initial, do: connected(state), else: state
-      state = if state.ready, do: publish(state), else: state
+  def handle_event({:call, from}, {:await_login, timeout}, phase, data) do
+    case login_result(phase, data.snapshot) do
+      :pending ->
+        ref = make_ref()
+        data = %{data | login_waiters: Map.put(data.login_waiters, ref, from)}
+        {:keep_state, data, [{{:timeout, {:login, ref}}, timeout, :expired}]}
 
-      if notification["Prefs"] || initial || notification["SelfChange"] || notification["State"],
-        do: notify_controller(state)
-
-      {:reply, :ok, state}
-    else
-      {:reply, {:error, :unsupported_version}, state}
+      result ->
+        {:keep_state_and_data, [{:reply, from, result}]}
     end
   end
 
-  def handle_call({:notification, _worker, _notification}, _from, state),
-    do: {:reply, {:error, :stale_stream}, state}
+  def handle_event(
+        {:call, from},
+        {:notification, worker, notification},
+        phase,
+        %{worker: worker} = data
+      ) do
+    if supported?(notification["Version"]) do
+      initial = is_map(notification["InitialStatus"])
+      data = %{data | snapshot: Snapshot.update(data.snapshot, notification)}
 
-  def handle_call({:auth, event}, _from, state) do
-    snapshot =
-      case event do
-        :starting -> %{state.snapshot | url: nil, error: nil, auth_attempt: true}
-        :logged_out -> %Snapshot{backend: :needs_login, version: state.snapshot.version}
-        {:url, url} -> Snapshot.update(state.snapshot, %{"BrowseToURL" => url})
-        {:error, reason} -> %{state.snapshot | url: nil, error: reason, auth_attempt: false}
-      end
+      {data, actions} =
+        cond do
+          initial -> connected(data)
+          phase == :ready -> publish(data)
+          true -> {data, []}
+        end
 
-    state = %{state | snapshot: snapshot}
-    state = if state.ready, do: publish(state), else: publish_auth_error(state, event)
-    {:reply, :ok, state}
+      if initial or Enum.any?(["Prefs", "SelfChange", "State"], &notification[&1]),
+        do: notify_controller(data)
+
+      {:next_state, if(initial, do: :ready, else: phase), data, [{:reply, from, :ok} | actions]}
+    else
+      {:keep_state_and_data, [{:reply, from, {:error, :unsupported_version}}]}
+    end
   end
 
+  def handle_event({:call, from}, {:notification, _worker, _notification}, _phase, _data),
+    do: {:keep_state_and_data, [{:reply, from, {:error, :stale_stream}}]}
+
+  def handle_event({:call, from}, {:auth, event}, phase, data) do
+    snapshot =
+      case event do
+        :starting -> %{data.snapshot | url: nil, error: nil, auth_attempt: true}
+        :logged_out -> %Snapshot{backend: :needs_login, version: data.snapshot.version}
+        {:url, url} -> Snapshot.update(data.snapshot, %{"BrowseToURL" => url})
+        {:error, reason} -> %{data.snapshot | url: nil, error: reason, auth_attempt: false}
+      end
+
+    data = %{data | snapshot: snapshot}
+
+    {data, actions} =
+      if phase == :ready,
+        do: publish(data),
+        else: data |> publish_auth_error(event) |> resolve_login(login_result(phase, snapshot))
+
+    {:keep_state, data, [{:reply, from, :ok} | actions]}
+  end
+
+  def handle_event(:internal, :connect, :backoff, data), do: connect(data)
+  def handle_event(:state_timeout, :connect, :backoff, data), do: connect(data)
+
+  def handle_event(:state_timeout, :initial_snapshot, :connecting, data),
+    do: disconnected(data, :snapshot_timeout)
+
+  def handle_event(
+        :info,
+        {:watch_ended, worker, {:error, reason}},
+        _phase,
+        %{worker: worker} = data
+      ),
+      do: disconnected(data, reason)
+
+  def handle_event(:info, {:EXIT, worker, _reason}, _phase, %{worker: worker} = data),
+    do: disconnected(data, :disconnected)
+
+  def handle_event({:timeout, {:ready, ref}}, :expired, _phase, data) do
+    case Map.pop(data.waiters, ref) do
+      {nil, _} ->
+        :keep_state_and_data
+
+      {from, waiters} ->
+        {:keep_state, %{data | waiters: waiters}, [{:reply, from, {:error, :unavailable}}]}
+    end
+  end
+
+  def handle_event({:timeout, {:login, ref}}, :expired, _phase, data) do
+    case Map.pop(data.login_waiters, ref) do
+      {nil, _} ->
+        :keep_state_and_data
+
+      {from, waiters} ->
+        {:keep_state, %{data | login_waiters: waiters}, [{:reply, from, {:error, :timeout}}]}
+    end
+  end
+
+  def handle_event({:timeout, :auth_url}, :expired, :ready, data) do
+    snapshot = %{data.snapshot | url: nil, error: :url_expired, auth_attempt: false}
+    {data, actions} = publish(%{data | snapshot: snapshot})
+    {:keep_state, data, actions}
+  end
+
+  def handle_event(:info, _message, _phase, _data), do: :keep_state_and_data
+
   @impl true
-  def handle_info(:connect, %{worker: nil} = state) do
+  def terminate(_reason, _phase, data) do
+    if data.worker, do: Process.exit(data.worker, :kill)
+  end
+
+  defp connect(data) do
     parent = self()
-    opts = state.opts
+    opts = data.opts
 
     worker =
       spawn_link(fn -> send(parent, {:watch_ended, self(), LocalAPI.watch(opts, parent)}) end)
 
-    timer =
-      Process.send_after(
-        self(),
-        {:initial_timeout, worker},
-        Keyword.get(opts, :initial_timeout, 10_000)
-      )
+    timeout = Keyword.get(opts, :initial_timeout, 10_000)
 
-    {:noreply, %{state | worker: worker, timer: nil, initial_timer: timer}}
+    {:next_state, :connecting, %{data | worker: worker},
+     [{:state_timeout, timeout, :initial_snapshot}]}
   end
 
-  def handle_info({:watch_ended, worker, {:error, reason}}, %{worker: worker} = state),
-    do: {:noreply, disconnected(state, reason)}
+  defp connected(data) do
+    generation = data.generation + 1
 
-  def handle_info({:EXIT, worker, _reason}, %{worker: worker} = state),
-    do: {:noreply, disconnected(state, :disconnected)}
-
-  def handle_info({:initial_timeout, worker}, %{worker: worker, ready: false} = state),
-    do: {:noreply, disconnected(state, :snapshot_timeout)}
-
-  def handle_info({:ready_timeout, ref}, state) do
-    case Map.pop(state.waiters, ref) do
-      {nil, _} ->
-        {:noreply, state}
-
-      {{from, _timer}, waiters} ->
-        GenServer.reply(from, {:error, :unavailable})
-        {:noreply, %{state | waiters: waiters}}
-    end
-  end
-
-  def handle_info({:expire_url, url}, %{snapshot: %{url: url}} = state) do
-    snapshot = %{state.snapshot | url: nil, error: :url_expired, auth_attempt: false}
-    {:noreply, publish(%{state | snapshot: snapshot, url_timer: nil})}
-  end
-
-  def handle_info(_message, state), do: {:noreply, state}
-
-  @impl true
-  def terminate(_reason, state) do
-    if state.worker, do: Process.exit(state.worker, :kill)
-  end
-
-  defp connected(state) do
-    cancel(state.initial_timer)
-    generation = state.generation + 1
-
-    PropertyTable.put_many(state.table, [
+    PropertyTable.put_many(data.table, [
       {["monitor", "connected"], true},
       {["monitor", "generation"], generation}
     ])
 
-    PropertyTable.delete(state.table, ["monitor", "error"])
+    PropertyTable.delete(data.table, ["monitor", "error"])
 
-    state =
+    {data, actions} =
       publish(%{
-        state
-        | ready: true,
-          initial_timer: nil,
-          generation: generation,
-          delay: Keyword.get(state.opts, :retry_min, 200)
+        data
+        | generation: generation,
+          delay: Keyword.get(data.opts, :retry_min, 200)
       })
 
-    Enum.each(state.waiters, fn {_ref, {from, timer}} ->
-      cancel(timer)
-      GenServer.reply(from, :ok)
-    end)
-
-    %{state | waiters: %{}}
+    replies = waiter_replies(data.waiters, :ready, :ok)
+    {%{data | waiters: %{}}, actions ++ replies}
   end
 
-  defp disconnected(state, reason) do
-    if state.worker, do: Process.exit(state.worker, :kill)
-    cancel(state.initial_timer)
-    timer = Process.send_after(self(), :connect, state.delay)
-    delay = min(state.delay * 2, Keyword.get(state.opts, :retry_max, 30_000))
-    state = unavailable(state, reason)
-    %{state | worker: nil, timer: timer, initial_timer: nil, delay: delay}
+  defp disconnected(data, reason) do
+    if data.worker, do: Process.exit(data.worker, :kill)
+    delay = data.delay
+    {data, actions} = unavailable(data, reason)
+
+    data = %{
+      data
+      | worker: nil,
+        delay: min(delay * 2, Keyword.get(data.opts, :retry_max, 30_000))
+    }
+
+    {:next_state, :backoff, data, [{:state_timeout, delay, :connect} | actions]}
   end
 
-  defp unavailable(state, reason) do
-    cancel(state.url_timer)
+  defp unavailable(data, reason) do
     retained = [["state"], ["backend_state"], ["auth", "state"]]
-    Enum.each(Map.keys(state.published) -- retained, &PropertyTable.delete(state.table, &1))
+    Enum.each(Map.keys(data.published) -- retained, &PropertyTable.delete(data.table, &1))
 
-    PropertyTable.put_many(state.table, [
+    PropertyTable.put_many(data.table, [
       {["state"], :unavailable},
       {["backend_state"], :unknown},
       {["auth", "state"], :unknown},
@@ -185,49 +228,71 @@ defmodule Tailscale.Monitor do
       {["monitor", "error"], reason}
     ])
 
-    notify_controller(state)
-    %{state | ready: false, snapshot: %Snapshot{}, published: %{}, url_timer: nil}
+    notify_controller(data)
+
+    {data, actions} =
+      resolve_login(%{data | snapshot: %Snapshot{}, published: %{}}, {:error, reason})
+
+    {data, [{{:timeout, :auth_url}, :cancel} | actions]}
   end
 
-  defp publish(state) do
-    properties = Snapshot.properties(state.snapshot)
-    old_url = state.published[["auth", "url"]]
+  defp publish(data) do
+    properties = Snapshot.properties(data.snapshot)
+    old_url = data.published[["auth", "url"]]
     new_url = properties[["auth", "url"]]
 
-    state =
-      if old_url != new_url do
-        cancel(state.url_timer)
+    actions =
+      cond do
+        old_url == new_url ->
+          []
 
-        timer =
-          if new_url,
-            do:
-              Process.send_after(
-                self(),
-                {:expire_url, new_url},
-                Keyword.get(state.opts, :auth_url_ttl, 600_000)
-              )
+        is_nil(new_url) ->
+          [{{:timeout, :auth_url}, :cancel}]
 
-        %{state | url_timer: timer}
-      else
-        state
+        true ->
+          [{{:timeout, :auth_url}, Keyword.get(data.opts, :auth_url_ttl, 600_000), :expired}]
       end
 
-    removed = Map.keys(state.published) -- Map.keys(properties)
-    Enum.each(removed, &PropertyTable.delete(state.table, &1))
-    PropertyTable.put_many(state.table, Map.to_list(properties))
-    %{state | published: properties}
+    removed = Map.keys(data.published) -- Map.keys(properties)
+    Enum.each(removed, &PropertyTable.delete(data.table, &1))
+    PropertyTable.put_many(data.table, Map.to_list(properties))
+
+    {data, replies} =
+      resolve_login(%{data | published: properties}, login_result(:ready, data.snapshot))
+
+    {data, actions ++ replies}
   end
 
-  defp publish_auth_error(state, {:error, reason}) do
-    PropertyTable.put_many(state.table, [{["auth", "state"], :error}, {["auth", "error"], reason}])
+  defp login_result(phase, _snapshot) when phase != :ready, do: {:error, :disconnected}
+  defp login_result(:ready, %{error: error}) when not is_nil(error), do: {:error, error}
+  defp login_result(:ready, %{backend: :running}), do: :ok
+  defp login_result(:ready, %{backend: :needs_machine_auth}), do: {:error, :needs_approval}
+  defp login_result(:ready, %{url: url}) when is_binary(url), do: {:ok, url}
+  defp login_result(:ready, %{backend: :stopped, auth_attempt: false}), do: {:error, :stopped}
+  defp login_result(:ready, %{auth_attempt: false}), do: {:error, :logged_out}
+  defp login_result(:ready, _snapshot), do: :pending
 
-    %{state | published: Map.put(state.published, ["auth", "error"], reason)}
+  defp resolve_login(data, :pending), do: {data, []}
+
+  defp resolve_login(data, result),
+    do: {%{data | login_waiters: %{}}, waiter_replies(data.login_waiters, :login, result)}
+
+  defp waiter_replies(waiters, kind, result) do
+    Enum.flat_map(waiters, fn {ref, from} ->
+      [{{:timeout, {kind, ref}}, :cancel}, {:reply, from, result}]
+    end)
   end
 
-  defp publish_auth_error(state, _event), do: state
+  defp publish_auth_error(data, {:error, reason}) do
+    PropertyTable.put_many(data.table, [{["auth", "state"], :error}, {["auth", "error"], reason}])
 
-  defp notify_controller(state) do
-    case Process.whereis(Keyword.fetch!(state.opts, :controller)) do
+    %{data | published: Map.put(data.published, ["auth", "error"], reason)}
+  end
+
+  defp publish_auth_error(data, _event), do: data
+
+  defp notify_controller(data) do
+    case Process.whereis(Keyword.fetch!(data.opts, :controller)) do
       nil -> :ok
       pid -> send(pid, :observed_change)
     end
@@ -246,6 +311,4 @@ defmodule Tailscale.Monitor do
   end
 
   defp supported?(_), do: false
-  defp cancel(nil), do: :ok
-  defp cancel(timer), do: Process.cancel_timer(timer)
 end

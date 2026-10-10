@@ -1,6 +1,6 @@
 defmodule Tailscale.ConfigurationTest do
   use ExUnit.Case, async: true
-  alias Tailscale.{Configuration, Serve}
+  alias Tailscale.Configuration
 
   test "normalizes managed values and CIDR networks" do
     assert {:ok, config} =
@@ -30,31 +30,11 @@ defmodule Tailscale.ConfigurationTest do
     end
   end
 
-  test "Serve has exclusive node ownership, preserves services, and refuses foreground sessions" do
-    current = %{
-      "TCP" => %{"80" => %{}},
-      "Web" => %{},
-      "AllowFunnel" => %{"old:80" => true},
-      "Services" => %{"svc:db" => %{}},
-      "Extension" => 1
-    }
+  test "configuration delegates Serve endpoint normalization" do
+    assert {:ok, config} =
+             Configuration.normalize(%{serve: [%{https: 443, to: "http://LOCALHOST:4000"}]})
 
-    assert {:ok, desired} =
-             Serve.build(current, [%{https: 443, to: "http://127.0.0.1:80"}], "device.ts.net")
-
-    assert desired["TCP"] == %{"443" => %{"HTTPS" => true}}
-    assert desired["Web"]["device.ts.net:443"]["Handlers"]["/"]["Proxy"] == "http://127.0.0.1:80"
-    assert desired["AllowFunnel"] == %{}
-    assert desired["Services"] == current["Services"]
-    assert desired["Extension"] == 1
-    assert {:ok, removed} = Serve.build(desired, [], nil)
-    assert removed["TCP"] == %{}
-
-    assert {:error, :awaiting_dns_name} =
-             Serve.build(%{}, [%{https: 443, to: "http://localhost"}], nil)
-
-    assert {:error, :serve_foreground_conflict} =
-             Serve.build(%{"Foreground" => %{"session" => %{}}}, [], nil)
+    assert config.serve == [%{https: 443, to: "http://localhost:4000"}]
   end
 
   test "observed preferences expose only managed fields, preserving false and normalizing nil routes" do
@@ -87,6 +67,13 @@ defmodule Tailscale.ConfigurationTest do
       })
 
     assert Configuration.patch(config, current) == %{}
+    assert Configuration.patch(%{}, current) == %{}
+    assert Configuration.patch(%{serve: []}, current) == %{}
+
+    assert Configuration.patch(%{hostname: "partial"}, current) == %{
+             "Hostname" => "partial",
+             "HostnameSet" => true
+           }
 
     assert Configuration.patch(%{config | ssh: true}, current) == %{
              "RunSSH" => true,

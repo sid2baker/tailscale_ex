@@ -115,7 +115,13 @@ defmodule Tailscale.Snapshot do
         do: %{snapshot | error: :authentication_failed, url: nil, auth_attempt: false},
         else: snapshot
 
-    if snapshot.backend in [:running, :stopped, :needs_machine_auth] do
+    # Start can leave the backend stopped until a later notification. Only a new
+    # stopped observation cancels login, not an unrelated preferences/peer update.
+    stopped =
+      snapshot.backend == :stopped and
+        (not is_nil(notification["State"]) or is_map(notification["InitialStatus"]))
+
+    if snapshot.backend in [:running, :needs_machine_auth] or stopped do
       %{snapshot | url: nil, error: nil, auth_attempt: false}
     else
       snapshot

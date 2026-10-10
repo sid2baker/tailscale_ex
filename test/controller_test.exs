@@ -112,12 +112,17 @@ defmodule Tailscale.ControllerTest do
     {:ok, serve} = Tailscale.Serve.build(%{}, endpoints, "device.ts.net")
 
     UnixHTTP.update(ctx.daemon, fn state ->
-      %{state | prefs: Map.put(state.prefs, "Hostname", "external"), serve: serve, etag: 2}
+      %{
+        state
+        | prefs: Map.put(state.prefs, "Hostname", "external.example"),
+          serve: serve,
+          etag: 2
+      }
     end)
 
     before = length(UnixHTTP.state(ctx.daemon).requests)
     assert :ok = Controller.update_configuration(ctx.controller, %{accept_dns: false})
-    assert configuration(ctx).hostname == "external"
+    assert configuration(ctx).hostname == "external.example"
     assert configuration(ctx).serve == endpoints
     refute configuration(ctx).accept_dns
 
@@ -125,8 +130,12 @@ defmodule Tailscale.ControllerTest do
 
     assert [
              %{method: "GET", path: "/localapi/v0/prefs"},
-             %{method: "GET", path: "/localapi/v0/serve-config"} | _
+             %{method: "PATCH", path: "/localapi/v0/prefs", body: body},
+             %{method: "GET", path: "/localapi/v0/prefs"},
+             %{method: "GET", path: "/localapi/v0/serve-config"}
            ] = requests
+
+    assert body == %{"CorpDNS" => false, "CorpDNSSet" => true}
   end
 
   test "concurrent updates preserve all disjoint changes", ctx do
@@ -150,23 +159,20 @@ defmodule Tailscale.ControllerTest do
     assert configuration(ctx) == expected
   end
 
-  test "failed update reads clear the cache and never write or replay changes", ctx do
+  test("failed preference reads clear the cache and never write or replay changes", ctx) do
     assert :ok = Controller.configure(ctx.controller, %{hostname: "retained", accept_dns: false})
     before = writes(UnixHTTP.state(ctx.daemon))
+    UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"GET", "/localapi/v0/prefs"}], 503))
 
-    for path <- ["/localapi/v0/prefs", "/localapi/v0/serve-config"] do
-      UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"GET", path}], 503))
+    assert {:error, {:http, 503}} =
+             Controller.update_configuration(ctx.controller, %{hostname: "must-not-apply"})
 
-      assert {:error, {:http, 503}} =
-               Controller.update_configuration(ctx.controller, %{hostname: "must-not-apply"})
-
-      assert configuration(ctx) == nil
-      assert PropertyTable.get(ctx.table, ["configuration", "error"]) == {:http, 503}
-      assert writes(UnixHTTP.state(ctx.daemon)) == before
-      UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
-      eventually(fn -> assert %{hostname: "retained", accept_dns: false} = configuration(ctx) end)
-      assert writes(UnixHTTP.state(ctx.daemon)) == before
-    end
+    assert configuration(ctx) == nil
+    assert PropertyTable.get(ctx.table, ["configuration", "error"]) == {:http, 503}
+    assert writes(UnixHTTP.state(ctx.daemon)) == before
+    UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
+    eventually(fn -> assert %{hostname: "retained", accept_dns: false} = configuration(ctx) end)
+    assert writes(UnixHTTP.state(ctx.daemon)) == before
   end
 
   test "failed update writes are not retried and leave existing settings intact", ctx do
@@ -187,6 +193,25 @@ defmodule Tailscale.ControllerTest do
 
     assert writes(UnixHTTP.state(ctx.daemon)) == before
     refute configuration(ctx).ssh
+  end
+
+  test "an acknowledged but ignored preference write fails readback before touching Serve", ctx do
+    dns(ctx)
+    # Return a successful HTTP response without applying the PATCH.
+    UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"PATCH", "/localapi/v0/prefs"}], 200))
+
+    assert {:error, :preferences_readback_mismatch} =
+             Controller.configure(ctx.controller, %{
+               hostname: "ignored",
+               serve: [%{https: 443, to: "http://localhost:4000"}]
+             })
+
+    assert configuration(ctx).hostname == ""
+    assert configuration(ctx).serve == []
+    assert UnixHTTP.state(ctx.daemon).serve == nil
+
+    assert PropertyTable.get(ctx.table, ["configuration", "error"]) ==
+             :preferences_readback_mismatch
   end
 
   test "failed mutations return errors and are never retried, even after a notification", ctx do
@@ -236,11 +261,12 @@ defmodule Tailscale.ControllerTest do
     assert {:error, {:http, 503}} =
              Controller.configure(ctx.controller, %{hostname: "partially-applied"})
 
-    assert configuration(ctx) == nil
+    assert configuration(ctx).hostname == "partially-applied"
+    refute Map.has_key?(configuration(ctx), :serve)
     assert UnixHTTP.state(ctx.daemon).prefs["Hostname"] == "partially-applied"
     count = writes(UnixHTTP.state(ctx.daemon))
     UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
-    eventually(fn -> assert is_map(configuration(ctx)) end)
+    eventually(fn -> assert Map.has_key?(configuration(ctx), :serve) end)
     assert configuration(ctx).hostname == "partially-applied"
     assert writes(UnixHTTP.state(ctx.daemon)) == count
   end
@@ -277,8 +303,9 @@ defmodule Tailscale.ControllerTest do
            end)
   end
 
-  test "unsupported external Serve config is reported rather than represented as empty", ctx do
-    UnixHTTP.update(ctx.daemon, &%{&1 | serve: %{"TCP" => %{"80" => %{"HTTP" => true}}}})
+  test("unsupported Serve stays untouched and does not block preference updates", ctx) do
+    unsupported = %{"TCP" => %{"80" => %{"HTTP" => true}}}
+    UnixHTTP.update(ctx.daemon, &%{&1 | serve: unsupported})
     UnixHTTP.notify(ctx.daemon, %{"Prefs" => %{}})
 
     eventually(fn ->
@@ -286,12 +313,20 @@ defmodule Tailscale.ControllerTest do
                :unsupported_serve_configuration
     end)
 
-    assert configuration(ctx) == nil
+    assert configuration(ctx).hostname == ""
+    refute Map.has_key?(configuration(ctx), :serve)
+    assert :ok = Controller.update_configuration(ctx.controller, %{hostname: "independent"})
+    assert configuration(ctx).hostname == "independent"
+    refute Map.has_key?(configuration(ctx), :serve)
+    assert UnixHTTP.state(ctx.daemon).serve == unsupported
+    assert writes(UnixHTTP.state(ctx.daemon)) == 1
 
-    assert {:error, :unsupported_serve_configuration} =
-             Controller.update_configuration(ctx.controller, %{hostname: "must-not-apply"})
+    assert PropertyTable.get(ctx.table, ["configuration", "error"]) ==
+             :unsupported_serve_configuration
 
-    assert writes(UnixHTTP.state(ctx.daemon)) == 0
+    assert :ok = Controller.update_configuration(ctx.controller, %{serve: []})
+    assert configuration(ctx).serve == []
+    assert configuration(ctx).hostname == "independent"
   end
 
   test "interactive login watches first and never reapplies application defaults", ctx do
@@ -345,6 +380,70 @@ defmodule Tailscale.ControllerTest do
            )
 
     assert UnixHTTP.state(ctx.daemon).prefs["LoggedOut"] == false
+  end
+
+  test "a successful replacement reuses verified responses without another refresh", ctx do
+    dns(ctx)
+    :sys.get_state(ctx.controller)
+    before = length(UnixHTTP.state(ctx.daemon).requests)
+    config = %{hostname: "verified", serve: [%{https: 443, to: "http://localhost:4000"}]}
+    assert :ok = Controller.configure(ctx.controller, config)
+    requests = Enum.drop(UnixHTTP.state(ctx.daemon).requests, before)
+
+    assert Enum.map(requests, &{&1.method, &1.path}) == [
+             {"GET", "/localapi/v0/prefs"},
+             {"PATCH", "/localapi/v0/prefs"},
+             {"GET", "/localapi/v0/prefs"},
+             {"GET", "/localapi/v0/serve-config"},
+             {"POST", "/localapi/v0/serve-config"},
+             {"GET", "/localapi/v0/serve-config"}
+           ]
+
+    assert configuration(ctx).hostname == config.hostname
+    assert configuration(ctx).serve == config.serve
+  end
+
+  test "unreadable omitted Serve does not fail a verified preference update", ctx do
+    UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"GET", "/localapi/v0/serve-config"}], 503))
+    assert :ok = Controller.update_configuration(ctx.controller, %{hostname: "independent"})
+    assert configuration(ctx).hostname == "independent"
+    refute Map.has_key?(configuration(ctx), :serve)
+    assert PropertyTable.get(ctx.table, ["configuration", "error"]) == {:http, 503}
+    count = writes(UnixHTTP.state(ctx.daemon))
+    UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
+    eventually(fn -> assert configuration(ctx)[:serve] == [] end)
+    assert writes(UnixHTTP.state(ctx.daemon)) == count
+  end
+
+  test "foreground Serve conflicts are isolated from preference-only updates", ctx do
+    serve = %{"Foreground" => %{"session" => %{}}}
+    UnixHTTP.update(ctx.daemon, &%{&1 | serve: serve})
+    assert :ok = Controller.update_configuration(ctx.controller, %{hostname: "independent"})
+    assert UnixHTTP.state(ctx.daemon).serve == serve
+
+    assert {:error, :serve_foreground_conflict} =
+             Controller.update_configuration(ctx.controller, %{serve: []})
+
+    assert UnixHTTP.state(ctx.daemon).serve == serve
+    assert configuration(ctx).hostname == "independent"
+    refute Map.has_key?(configuration(ctx), :serve)
+  end
+
+  test "successful notification refresh cancels backoff and ignores stale retry tokens", ctx do
+    :sys.replace_state(ctx.controller, &%{&1 | delay: 5_000})
+    UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"GET", "/localapi/v0/prefs"}], 503))
+    UnixHTTP.notify(ctx.daemon, %{"Prefs" => %{}})
+    eventually(fn -> assert configuration(ctx) == nil end)
+    {timer, token} = :sys.get_state(ctx.controller).timer
+    UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
+    UnixHTTP.notify(ctx.daemon, %{"Prefs" => %{}})
+    eventually(fn -> assert is_map(configuration(ctx)) end)
+    assert :sys.get_state(ctx.controller).timer == nil
+    assert Process.read_timer(timer) == false
+    before = UnixHTTP.state(ctx.daemon).requests
+    send(ctx.controller, {:refresh, token})
+    :sys.get_state(ctx.controller)
+    assert UnixHTTP.state(ctx.daemon).requests == before
   end
 
   defp dns(ctx) do

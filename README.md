@@ -48,25 +48,34 @@ compatibility testing. To attach to an existing daemon, set
 
 ## Configure and log in
 
-Once `Tailscale.get(["monitor", "connected"])` is `true`:
+Commands wait briefly for the daemon's initial observation; no startup polling is needed.
 
 ```elixir
 :ok = Tailscale.configure(%{hostname: "my-device", accept_dns: false})
-:ok = Tailscale.login()
-Tailscale.get(["auth", "url"]) # Open this URL; it may take a moment to appear.
+{:ok, url} = Tailscale.login()
+IO.puts(url) # Open this URL in a browser.
 
 # Or use a key from your secret source:
 :ok = Tailscale.login(auth_key: key)
 ```
 
-Wait for `Tailscale.get(["state"]) == :online`. Login initiates enrollment; it does
-not wait for completion. `Tailscale.logout/0` logs out without deleting identity.
+Browser login returns `{:ok, url}`, or `:ok` if already online. It waits up to
+30 seconds for the URL (`login(timeout: 60_000)` overrides this), not for browser
+completion. A timeout does not cancel enrollment. Key login returns after initiation.
+Observe `["state"]` for `:online`; machine approval may still be required.
+`Tailscale.logout/0` logs out without deleting identity.
 
 Both configuration APIs work while running:
 
 - `configure/1` replaces the **complete managed configuration**; omitted fields use defaults.
-- `update_configuration/1` changes only supplied fields, preserving the rest from a fresh
-  daemon read. Lists replace completely; updates from library callers are serialized.
+- `update_configuration/1` writes only supplied fields. Omitted Serve settings remain
+  untouched, even if unsupported by this library. Lists replace completely.
+
+Both verify writes by readback and serialize library callers. Preferences and Serve
+are separate operations, not a transaction: errors can leave partial changes.
+`get_configuration/0` returns observed settings, not a saved desired configuration.
+If Serve is unreadable or unsupported, the map omits `:serve` and
+`["configuration", "error"]` explains why; preference updates still work.
 
 Startup only reads existing settings. The daemon owns persistence; settings made
 before enrollment may be lost on restart. Failed operations return `{:error, reason}`
@@ -87,9 +96,17 @@ Visit `https://<dns_name>/` from an authorized tailnet device. This does not ena
 public Funnel access or replace your app's authentication. Setting `serve` replaces
 all top-level Serve listeners and Funnel settings; `serve: []` removes them.
 
-## Read state and subscribe
+## Inspect state and subscribe
 
-Subscribe before reading; subscriptions deliver changes, not an initial snapshot.
+For a readable status, configuration, and peer report in IEx:
+
+```elixir
+Tailscale.info()
+```
+
+The report uses cached observations and omits login URLs. For programmatic reads
+and reactive clients, subscribe before reading; subscriptions deliver changes,
+not an initial snapshot.
 
 ```elixir
 :ok = Tailscale.subscribe(["state"])

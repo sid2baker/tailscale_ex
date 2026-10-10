@@ -87,6 +87,23 @@ defmodule Tailscale.MonitorTest do
     assert new_url == url <> "-new"
   end
 
+  test "a replaced stream cannot change state or trigger another reconnect", ctx do
+    {:ready, %{worker: old_worker}} = :sys.get_state(ctx.monitor)
+    UnixHTTP.disconnect(ctx.daemon)
+    eventually(fn -> assert PropertyTable.get(ctx.table, ["monitor", "generation"]) == 2 end)
+    {:ready, %{worker: worker}} = :sys.get_state(ctx.monitor)
+    refute worker == old_worker
+
+    assert {:error, :stale_stream} =
+             :gen_statem.call(ctx.monitor, {:notification, old_worker, %{"State" => 6}})
+
+    send(ctx.monitor, {:watch_ended, old_worker, {:error, :disconnected}})
+    send(ctx.monitor, {:EXIT, old_worker, :normal})
+    assert :ok = Monitor.ready(ctx.monitor)
+    assert {:ready, %{worker: ^worker, generation: 2}} = :sys.get_state(ctx.monitor)
+    assert PropertyTable.get(ctx.table, ["state"]) == :offline
+  end
+
   test "authentication URL notifications, completion and error redaction", ctx do
     UnixHTTP.notify(ctx.daemon, %{"BrowseToURL" => "https://login.tailscale.com/a/example"})
 
@@ -102,6 +119,51 @@ defmodule Tailscale.MonitorTest do
     eventually(fn ->
       assert PropertyTable.get(ctx.table, ["auth", "error"]) == :authentication_failed
     end)
+  end
+
+  test "login waiters have independent deadlines and are cleared on completion", ctx do
+    assert :ok = Monitor.auth(ctx.monitor, :starting)
+    short = Task.async(fn -> Monitor.await_login(ctx.monitor, 100) end)
+    long = Task.async(fn -> Monitor.await_login(ctx.monitor, 5_000) end)
+    eventually(fn -> assert map_size(elem(:sys.get_state(ctx.monitor), 1).login_waiters) == 2 end)
+    assert :ok = Monitor.ready(ctx.monitor)
+    assert Task.await(short) == {:error, :timeout}
+    assert map_size(elem(:sys.get_state(ctx.monitor), 1).login_waiters) == 1
+    url = "https://login.tailscale.com/a/shared"
+    UnixHTTP.notify(ctx.daemon, %{"BrowseToURL" => url})
+    assert Task.await(long) == {:ok, url}
+    assert {:ready, %{login_waiters: %{}}} = :sys.get_state(ctx.monitor)
+    assert elem(:sys.get_state(ctx.monitor), 1).login_waiters == %{}
+  end
+
+  test "starting from stopped waits for a URL or a running notification", ctx do
+    UnixHTTP.notify(ctx.daemon, %{"State" => 4})
+    eventually(fn -> assert PropertyTable.get(ctx.table, ["backend_state"]) == :stopped end)
+    assert :ok = Monitor.auth(ctx.monitor, :starting)
+    login = Task.async(fn -> Monitor.await_login(ctx.monitor, 5_000) end)
+    eventually(fn -> assert map_size(elem(:sys.get_state(ctx.monitor), 1).login_waiters) == 1 end)
+    UnixHTTP.notify(ctx.daemon, %{"State" => 6})
+    assert Task.await(login) == :ok
+  end
+
+  test "a stopped snapshot preserves a new login across unrelated notifications" do
+    snapshot = %Snapshot{backend: :stopped, auth_attempt: true}
+    snapshot = Snapshot.update(snapshot, %{"Prefs" => %{}})
+    assert snapshot.auth_attempt
+
+    url = "https://login.tailscale.com/a/resuming"
+    snapshot = Snapshot.update(snapshot, %{"BrowseToURL" => url})
+    assert snapshot.url == url
+    assert snapshot.auth_attempt
+
+    failed = Snapshot.update(snapshot, %{"ErrMessage" => "private error"})
+    assert failed.error == :authentication_failed
+    assert failed.url == nil
+    assert Snapshot.update(failed, %{"Prefs" => %{}}).error == :authentication_failed
+
+    stopped = Snapshot.update(snapshot, %{"State" => 4})
+    assert stopped.url == nil
+    refute stopped.auth_attempt
   end
 
   test "snapshot tolerates missing fields and removes missing values on replacement" do

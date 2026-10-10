@@ -26,7 +26,13 @@ defmodule Tailscale.Controller do
       delay: Keyword.get(opts, :retry_min, 200)
     }
 
-    {:ok, schedule(state, 0)}
+    {:ok, state, {:continue, :refresh}}
+  end
+
+  @impl true
+  def handle_continue(:refresh, state) do
+    {_result, state} = refresh(state)
+    {:noreply, state}
   end
 
   @impl true
@@ -47,7 +53,7 @@ defmodule Tailscale.Controller do
 
   def handle_call({:login, mode}, _from, state) do
     result =
-      with :ok <- Monitor.ready(state.monitor) do
+      with :ok <- ready(state) do
         login_attempt(state, mode)
       end
 
@@ -55,16 +61,16 @@ defmodule Tailscale.Controller do
       Monitor.auth(state.monitor, {:error, elem(result, 1)})
     end
 
-    {:reply, result, schedule(state, 0)}
+    {:reply, result, state}
   end
 
   def handle_call(:logout, _from, state) do
     result =
-      with :ok <- Monitor.ready(state.monitor),
+      with :ok <- ready(state),
            {:ok, _, _} <- LocalAPI.request(state.opts, "POST", "logout"),
            do: Monitor.auth(state.monitor, :logged_out)
 
-    {:reply, result, schedule(state, 0)}
+    {:reply, result, state}
   end
 
   @impl true
@@ -73,83 +79,117 @@ defmodule Tailscale.Controller do
     {:noreply, state}
   end
 
-  def handle_info(:observed_change, state), do: {:noreply, schedule(state, 0)}
+  def handle_info(:observed_change, state) do
+    {_result, state} = refresh(state)
+    {:noreply, state}
+  end
+
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
   def format_status(status), do: Map.put(status, :message, :redacted)
 
   defp update_now(state, changes) do
-    with {:ok, _validated} <- Configuration.normalize(changes),
-         {:ok, state} <- refresh(state) do
-      current = PropertyTable.get(state.table, ["configuration", "value"])
-      configure_now(state, Map.merge(current, changes))
-    else
-      {:error, _reason} = error -> {error, state}
-      {error, updated_state} -> {error, updated_state}
+    case Configuration.normalize(changes) do
+      {:ok, normalized} -> apply_configuration(state, Map.take(normalized, Map.keys(changes)))
+      error -> {error, state}
     end
   end
 
   defp configure_now(state, input) do
     case Configuration.normalize(input) do
-      {:ok, config} ->
-        configuration_status(state, :applying, nil)
-        result = apply_configuration(state, config)
-        {readback, state} = refresh(state)
-
-        case result do
-          :ok ->
-            {readback, state}
-
-          {:error, reason} ->
-            configuration_status(state, :error, reason)
-            {result, state}
-        end
-
-      error ->
-        {error, state}
+      {:ok, config} -> apply_configuration(state, config)
+      error -> {error, state}
     end
   end
 
-  defp apply_configuration(state, config) do
-    dns_name = PropertyTable.get(state.table, ["dns_name"])
+  defp apply_configuration(state, changes) do
+    state = cancel_retry(state)
+    configuration_status(state, :applying, nil)
 
-    with :ok <- connected(state),
-         {:ok, _} <- Serve.build(%{}, config.serve, dns_name),
-         :ok <- preferences(state.opts, config) do
-      Serve.reconcile(state.opts, config.serve, dns_name)
+    with :ok <- ready(state),
+         dns_name = PropertyTable.get(state.table, ["dns_name"]),
+         {:ok, _} <- Serve.build(%{}, Map.get(changes, :serve, []), dns_name),
+         {:ok, prefs} <- preferences(state.opts, changes) do
+      configure_serve(state, prefs, changes, dns_name)
+    else
+      error -> failed_operation(state, error)
     end
+  end
+
+  defp configure_serve(state, prefs, %{serve: endpoints}, dns_name) do
+    case Serve.reconcile(state.opts, endpoints, dns_name) do
+      {:ok, serve} -> observe(state, prefs, {:ok, serve})
+      error -> failed_operation(state, error)
+    end
+  end
+
+  defp configure_serve(state, prefs, _changes, _dns_name) do
+    {_observation, state} = observe(state, prefs, read_serve(state.opts))
+    {:ok, state}
+  end
+
+  defp failed_operation(state, {:error, reason} = error) do
+    {_readback, state} = refresh(state)
+    configuration_status(state, :error, reason)
+    {error, state}
+  end
+
+  defp ready(state) do
+    Monitor.ready(state.monitor, Keyword.get(state.opts, :timeout, 5_000))
   end
 
   # Only observations are retried. No desired configuration or failed mutation is retained.
   defp refresh(state) do
+    state = cancel_retry(state)
+
+    with :ok <- connected(state),
+         {:ok, prefs} <- read_preferences(state.opts) do
+      observe(state, prefs, read_serve(state.opts))
+    else
+      {:error, _} = error ->
+        PropertyTable.delete(state.table, ["configuration", "value"])
+        observation_result(state, error)
+    end
+  end
+
+  defp read_serve(opts) do
+    with {:ok, raw, _} <- LocalAPI.request(opts, "GET", "serve-config") do
+      Serve.decode(raw)
+    end
+  end
+
+  defp observe(state, prefs, serve_result) do
+    serve =
+      case serve_result do
+        {:ok, endpoints} -> endpoints
+        {:error, _} -> nil
+      end
+
+    PropertyTable.put(
+      state.table,
+      ["configuration", "value"],
+      Configuration.observed(prefs, serve)
+    )
+
     result =
-      with :ok <- connected(state),
-           {:ok, prefs} <- read_preferences(state.opts),
-           {:ok, raw, _} <- LocalAPI.request(state.opts, "GET", "serve-config"),
-           {:ok, serve} <- Serve.decode(raw) do
-        PropertyTable.put(
-          state.table,
-          ["configuration", "value"],
-          Configuration.observed(prefs, serve)
-        )
-
-        :ok
+      case serve_result do
+        {:ok, _} -> :ok
+        error -> error
       end
 
-    state =
-      case result do
-        :ok ->
-          configuration_status(state, :ready, nil)
-          %{state | delay: Keyword.get(state.opts, :retry_min, 200)}
+    observation_result(state, result)
+  end
 
-        {:error, reason} ->
-          PropertyTable.delete(state.table, ["configuration", "value"])
-          configuration_status(state, :error, reason)
-          if retry?(reason), do: retry(state), else: state
-      end
+  defp observation_result(state, :ok) do
+    configuration_status(state, :ready, nil)
+    {:ok, %{state | delay: Keyword.get(state.opts, :retry_min, 200)}}
+  end
 
-    {result, state}
+  defp observation_result(state, {:error, reason} = error) do
+    configuration_status(state, :error, reason)
+
+    {error, if(retry?(reason), do: retry(state), else: state)}
   end
 
   defp connected(state) do
@@ -160,7 +200,8 @@ defmodule Tailscale.Controller do
 
   defp preferences(opts, config) do
     with {:ok, current} <- read_preferences(opts) do
-      apply_preferences(opts, config, Configuration.patch(config, current))
+      patch = Configuration.patch(config, current)
+      if map_size(patch) == 0, do: {:ok, current}, else: apply_preferences(opts, config, patch)
     end
   end
 
@@ -172,13 +213,11 @@ defmodule Tailscale.Controller do
     end
   end
 
-  defp apply_preferences(_opts, _config, patch) when map_size(patch) == 0, do: :ok
-
   defp apply_preferences(opts, config, patch) do
     with {:ok, _, _} <- LocalAPI.request(opts, "PATCH", "prefs", patch),
          {:ok, actual} <- read_preferences(opts) do
       if Configuration.patch(config, actual) == %{},
-        do: :ok,
+        do: {:ok, actual},
         else: {:error, :preferences_readback_mismatch}
     end
   end
@@ -245,15 +284,15 @@ defmodule Tailscale.Controller do
   defp retry?(reason), do: reason not in [:unsupported_serve_configuration, :unsupported_version]
 
   defp retry(state) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:refresh, token}, state.delay)
     next = min(state.delay * 2, Keyword.get(state.opts, :retry_max, 30_000))
-    %{schedule(state, state.delay) | delay: next}
+    %{state | timer: {timer, token}, delay: next}
   end
 
-  defp schedule(state, delay) do
+  defp cancel_retry(state) do
     if state.timer, do: Process.cancel_timer(elem(state.timer, 0))
-    token = make_ref()
-    timer = Process.send_after(self(), {:refresh, token}, delay)
-    %{state | timer: {timer, token}}
+    %{state | timer: nil}
   end
 
   defp configuration_status(state, value, error) do

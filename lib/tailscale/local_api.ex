@@ -183,7 +183,7 @@ defmodule Tailscale.LocalAPI do
 
   defp deliver(frames, consumer) do
     Enum.reduce_while(frames, :ok, fn frame, :ok ->
-      case GenServer.call(consumer, {:notification, self(), frame}, :infinity) do
+      case :gen_statem.call(consumer, {:notification, self(), frame}, :infinity) do
         :ok -> {:cont, :ok}
         error -> {:halt, error}
       end

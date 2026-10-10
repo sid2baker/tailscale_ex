@@ -5,6 +5,58 @@ defmodule Tailscale.ServeTest do
 
   @endpoints [%{https: 443, to: "http://127.0.0.1:80"}]
 
+  test "normalizes endpoints, sorts ports, and rejects ambiguous or unsafe settings" do
+    assert {:ok, endpoints} =
+             Serve.normalize([
+               %{https: 8443, to: "http://LOCALHOST:4000"},
+               %{https: 443, to: "https://LOCALHOST:4443/app"}
+             ])
+
+    assert endpoints == [
+             %{https: 443, to: "https://localhost:4443/app"},
+             %{https: 8443, to: "http://localhost:4000"}
+           ]
+
+    assert {:ok, []} = Serve.normalize([])
+    assert {:error, :duplicate_serve_port} = Serve.normalize(@endpoints ++ @endpoints)
+
+    for invalid <- [
+          nil,
+          [%{https: 0, to: "http://localhost"}],
+          [%{https: 443, to: "http://user:secret@localhost"}],
+          [%{https: 443, to: "ftp://localhost"}],
+          [%{https: 443, to: "http://localhost/#fragment"}],
+          [%{https: 443, to: "http://localhost", unknown: true}]
+        ] do
+      assert {:error, reason} = Serve.normalize(invalid)
+      refute inspect(reason) =~ "secret"
+    end
+  end
+
+  test "Serve has exclusive node ownership, preserves services, and refuses foreground sessions" do
+    current = %{
+      "TCP" => %{"80" => %{}},
+      "Web" => %{},
+      "AllowFunnel" => %{"old:80" => true},
+      "Services" => %{"svc:db" => %{}},
+      "Extension" => 1
+    }
+
+    assert {:ok, desired} = Serve.build(current, @endpoints, "device.ts.net")
+    assert desired["TCP"] == %{"443" => %{"HTTPS" => true}}
+    assert desired["Web"]["device.ts.net:443"]["Handlers"]["/"]["Proxy"] == "http://127.0.0.1:80"
+    assert desired["AllowFunnel"] == %{}
+    assert desired["Services"] == current["Services"]
+    assert desired["Extension"] == 1
+    assert {:ok, removed} = Serve.build(desired, [], nil)
+    assert removed["TCP"] == %{}
+
+    assert {:error, :awaiting_dns_name} = Serve.build(%{}, @endpoints, nil)
+
+    assert {:error, :serve_foreground_conflict} =
+             Serve.build(%{"Foreground" => %{"session" => %{}}}, [], nil)
+  end
+
   test "decodes supported daemon settings without dropping unsupported node settings" do
     assert {:ok, raw} =
              Serve.build(%{"Services" => %{"svc:db" => %{}}}, @endpoints, "device.ts.net")

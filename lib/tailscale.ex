@@ -1,10 +1,12 @@
 defmodule Tailscale do
   @moduledoc """
-  Declarative Tailscale networking for Elixir and Nerves.
+  Supervised Tailscale networking for Elixir and Nerves.
 
-  `configure/1` replaces managed settings through LocalAPI; `update_configuration/1`
-  changes selected fields while preserving the others. Both work at runtime.
-  The daemon owns persistence.
+  The daemon owns configuration, identity, authentication, and persistence.
+  This library manages its lifecycle, issues commands, and caches observations.
+  `configure/1` replaces managed settings; `update_configuration/1` changes only
+  the supplied fields. Commands wait briefly for the observer to become ready;
+  callers do not need to coordinate startup.
   `get/2`, `get_by_prefix/1`, `get_configuration/0`, and subscriptions never perform
   daemon I/O. Startup reads existing settings; only `reset_to_defaults/0` applies
   application `config:` defaults. Subscribe **before** reading an initial value.
@@ -24,7 +26,8 @@ defmodule Tailscale do
   * `["peers", id, field]`: stable node ID (numeric fallback), with `"hostname"`,
     `"dns_name"`, `"ipv4"`, `"ipv6"`, and `"online"` fields. Missing values are absent.
   * `["health"]`: list of daemon health warning strings.
-  * `["configuration", "value"]`: cached managed configuration, absent when unreadable.
+  * `["configuration", "value"]`: cached managed configuration, absent when preferences
+    are unreadable. The `:serve` field is omitted when Serve cannot be read or represented.
   * `["configuration", "state"]`: `:ready | :applying | :error` (latest operation/read).
   * `["configuration", "error"]`: sanitized failure reason, absent on a successful read.
   * `["monitor", "connected"]`, `["monitor", "generation"]`, `["monitor", "error"]`:
@@ -64,15 +67,21 @@ defmodule Tailscale do
   Change selected managed settings while running. Omitted fields are preserved;
   lists are replaced, not appended (`serve: []` removes all managed listeners).
 
-  Reads fresh daemon settings and merges changes inside the Controller, serializing
-  library callers. A failed read returns an error without writing. Validation,
-  apply/readback, and persistence semantics are the same as `configure/1`.
+  Serializes library callers and writes only supplied preference fields. Omitted
+  Serve settings are left untouched, even if this library cannot represent them.
+  A failure to observe omitted Serve settings does not fail a preference update;
+  it is reported through the configuration cache instead. Validation, readback,
+  and persistence semantics are otherwise the same as `configure/1`.
   External writes and the separate preferences/Serve operations are not transactional.
   """
   @spec update_configuration(configuration()) :: result()
   def update_configuration(changes), do: Controller.update_configuration(Controller, changes)
 
-  @doc "Return cached daemon settings, or nil before a successful read or when unreadable."
+  @doc """
+  Return cached daemon settings, or nil when preferences are unavailable.
+  The `:serve` field is omitted when unreadable or unsupported; see
+  `["configuration", "error"]` for the reason. Missing Serve is not an empty list.
+  """
   @spec get_configuration() :: configuration() | nil
   def get_configuration, do: get(["configuration", "value"])
 
@@ -101,14 +110,24 @@ defmodule Tailscale do
   def unsubscribe(path), do: PropertyTable.unsubscribe(Tailscale.Properties, path)
 
   @doc """
-  Initiate browser login, or unattended enrollment with `auth_key: key`.
-  Waits for the event stream and initiation only, never for browser completion.
-  Browser login is a no-op if already running. On interruption or URL expiration,
-  call again. Observe `["auth"]` for progress. Credentials are not persisted or logged.
+  Return `{:ok, url}` for browser enrollment, or `:ok` if already running.
+  Waits up to 30 seconds for the URL after initiating login, never for browser
+  completion. Override this URL wait with `timeout: milliseconds`. A timeout
+  does not cancel enrollment; call again after an interruption or URL expiration.
+
+  With `auth_key: key`, returns `:ok` after initiating unattended enrollment.
+  Observe `["state"]` or `["auth"]` for completion. Machine approval is reported
+  as `{:error, :needs_approval}` for browser login. Credentials are not persisted or logged.
   """
-  @spec login(keyword()) :: result()
+  @spec login(keyword()) :: result() | {:ok, String.t()}
   def login(opts \\ [])
-  def login([]), do: Controller.login(Controller, :interactive)
+  def login([]), do: login(timeout: 30_000)
+
+  def login(timeout: timeout) when is_integer(timeout) and timeout in 1..4_294_967_295 do
+    with :ok <- Controller.login(Controller, :interactive) do
+      Tailscale.Monitor.await_login(Tailscale.Monitor, timeout)
+    end
+  end
 
   def login(auth_key: key) when is_binary(key) and byte_size(key) in 1..4096 do
     Controller.login(Controller, {:auth_key, key})
@@ -122,15 +141,7 @@ defmodule Tailscale do
   @spec logout() :: result()
   def logout, do: Controller.logout(Controller)
 
-  @doc "Return cached configuration and properties for diagnostics, redacting login URLs."
-  @spec info() :: %{configuration: configuration() | nil, properties: [{path(), term()}]}
-  def info do
-    properties =
-      Enum.map(get_by_prefix([]), fn
-        {["auth", "url"] = path, _url} -> {path, :redacted}
-        property -> property
-      end)
-
-    %{configuration: get_configuration(), properties: properties}
-  end
+  @doc "Print a readable cached status report, without login URLs or daemon I/O."
+  @spec info() :: :ok
+  def info, do: Tailscale.Info.print()
 end

@@ -130,7 +130,7 @@ defmodule Tailscale.LocalAPITest do
     worker = watch(server)
 
     assert_receive {:"$gen_call", from, {:notification, ^worker, %{"State" => 2}}}, 1_000
-    GenServer.reply(from, :ok)
+    :gen_statem.reply(from, :ok)
     assert_receive {:watch_ended, ^worker, {:error, :disconnected}}, 1_000
     refute_receive {:"$gen_call", _, {:notification, ^worker, _}}, 50
   end
@@ -149,9 +149,9 @@ defmodule Tailscale.LocalAPITest do
     worker = watch(server)
     assert_receive {:"$gen_call", first, {:notification, ^worker, %{"State" => 2}}}, 1_000
     refute_receive {:"$gen_call", _, {:notification, ^worker, _}}, 50
-    GenServer.reply(first, :ok)
+    :gen_statem.reply(first, :ok)
     assert_receive {:"$gen_call", second, {:notification, ^worker, %{"State" => 6}}}, 1_000
-    GenServer.reply(second, :ok)
+    :gen_statem.reply(second, :ok)
     assert_receive {:watch_ended, ^worker, {:error, :disconnected}}, 1_000
   end
 
