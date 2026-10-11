@@ -106,6 +106,29 @@ defmodule Tailscale.DaemonIntegrationTest do
     assert configuration(ctx).hostname == ""
   end
 
+  test "real daemon accepts running preference changes without enrollment or process restart",
+       ctx do
+    assert :ok =
+             Controller.update_configuration(ctx.opts[:controller], %{hostname: "tsx-control"})
+
+    daemon_pid = :sys.get_state(ctx.opts[:daemon]).pid
+
+    assert {:ok, original, _} = LocalAPI.request(ctx.opts, "GET", "prefs")
+    assert {:ok, original_serve, _} = LocalAPI.request(ctx.opts, "GET", "serve-config")
+
+    for running <- [true, false, false, true] do
+      assert :ok = Controller.set_running(ctx.opts[:controller], running)
+      assert {:ok, actual, _} = LocalAPI.request(ctx.opts, "GET", "prefs")
+      assert actual["WantRunning"] == running
+      assert Map.delete(actual, "WantRunning") == Map.delete(original, "WantRunning")
+      assert {:ok, ^original_serve, _} = LocalAPI.request(ctx.opts, "GET", "serve-config")
+      assert :sys.get_state(ctx.opts[:daemon]).pid == daemon_pid
+    end
+
+    assert PropertyTable.get(ctx.table, ["state"]) != :online
+    # Preference readback does not establish termination of active forwarding sessions.
+  end
+
   @tag :network
   test "real browser enrollment emits a URL and preserves the generated machine identity on restart",
        ctx do

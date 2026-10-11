@@ -16,6 +16,8 @@ defmodule Tailscale.RecoveryTest do
     Monitor.auth(opts[:monitor], {:error, :unavailable})
     assert PropertyTable.get(opts[:table], ["state"]) == :unavailable
     assert {:error, _} = Controller.configure(opts[:controller], %{hostname: "not-queued"})
+    assert {:error, _} = Controller.set_running(opts[:controller], true)
+    assert {:error, _} = Controller.set_running(opts[:controller], false)
     assert PropertyTable.get(opts[:table], ["configuration", "value"]) == nil
     {:ok, daemon} = Fixture.daemon(socket: socket)
     assert :ok = Monitor.ready(opts[:monitor])
@@ -34,6 +36,8 @@ defmodule Tailscale.RecoveryTest do
     commands = [
       {Configure, fn server -> Controller.configure(server, %{hostname: "ready"}) end},
       {Update, fn server -> Controller.update_configuration(server, %{hostname: "ready"}) end},
+      {Up, fn server -> Controller.set_running(server, true) end},
+      {Down, fn server -> Controller.set_running(server, false) end},
       {Login, fn server -> Controller.login(server, :interactive) end},
       {Logout, &Controller.logout/1}
     ]

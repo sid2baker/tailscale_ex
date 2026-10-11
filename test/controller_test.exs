@@ -36,6 +36,82 @@ defmodule Tailscale.ControllerTest do
     assert UnixHTTP.state(ctx.daemon).prefs["Unmanaged"] == "kept"
   end
 
+  test "running commands write only WantRunning and verify it without changing authentication or Serve",
+       ctx do
+    UnixHTTP.update(ctx.daemon, fn state ->
+      %{
+        state
+        | prefs:
+            Map.merge(state.prefs, %{
+              "Hostname" => "existing",
+              "AdvertiseRoutes" => ["10.0.0.0/24"],
+              "LoggedOut" => true,
+              "Persist" => %{"PrivateNodeKey" => "fixture-key"}
+            }),
+          serve: %{"TCP" => %{"443" => %{"HTTPS" => true}}}
+      }
+    end)
+
+    original = UnixHTTP.state(ctx.daemon)
+
+    for running <- [false, true, true, false] do
+      before = length(UnixHTTP.state(ctx.daemon).requests)
+      assert :ok = Controller.set_running(ctx.controller, running)
+      actual = UnixHTTP.state(ctx.daemon)
+      assert actual.prefs == Map.put(original.prefs, "WantRunning", running)
+      assert actual.serve == original.serve
+
+      assert [
+               %{method: "PATCH", path: "/localapi/v0/prefs", body: body},
+               %{method: "GET", path: "/localapi/v0/prefs"}
+             ] = Enum.drop(actual.requests, before)
+
+      assert body == %{"WantRunning" => running, "WantRunningSet" => true}
+    end
+
+    assert PropertyTable.get(ctx.table, ["state"]) == :offline
+    assert PropertyTable.get(ctx.table, ["auth", "state"]) == :needs_login
+  end
+
+  test "running commands report write and readback failures without replay", ctx do
+    for {method, status, reason, applied} <- [
+          {"PATCH", 403, {:http, 403}, false},
+          {"PATCH", 200, :preferences_readback_mismatch, false},
+          {"GET", 503, {:http, 503}, true}
+        ] do
+      UnixHTTP.update(ctx.daemon, fn state ->
+        %{
+          state
+          | prefs: Map.put(state.prefs, "WantRunning", false),
+            failures: %{{method, "/localapi/v0/prefs"} => status}
+        }
+      end)
+
+      assert {:error, ^reason} = Controller.set_running(ctx.controller, true)
+      assert UnixHTTP.state(ctx.daemon).prefs["WantRunning"] == applied
+      count = writes(UnixHTTP.state(ctx.daemon))
+      UnixHTTP.update(ctx.daemon, &%{&1 | failures: %{}})
+      UnixHTTP.notify(ctx.daemon, %{"Prefs" => %{}})
+      Process.sleep(150)
+      assert writes(UnixHTTP.state(ctx.daemon)) == count
+    end
+  end
+
+  test "running commands serialize with configuration updates", ctx do
+    tasks = [
+      Task.async(fn -> Controller.set_running(ctx.controller, true) end),
+      Task.async(fn ->
+        Controller.update_configuration(ctx.controller, %{hostname: "updated"})
+      end),
+      Task.async(fn -> Controller.update_configuration(ctx.controller, %{accept_dns: false}) end)
+    ]
+
+    assert Enum.all?(Task.await_many(tasks), &(&1 == :ok))
+
+    assert %{"WantRunning" => true, "Hostname" => "updated", "CorpDNS" => false} =
+             UnixHTTP.state(ctx.daemon).prefs
+  end
+
   test "configuration replacement, removal, and idempotent readback", ctx do
     dns(ctx)
     config = %{hostname: "nerves", ssh: true, serve: [%{https: 443, to: "http://127.0.0.1"}]}

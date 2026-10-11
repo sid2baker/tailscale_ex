@@ -13,6 +13,10 @@ defmodule Tailscale.Controller do
     do: GenServer.call(server, {:update_configuration, changes}, :infinity)
 
   def reset(server), do: GenServer.call(server, :reset, :infinity)
+
+  def set_running(server, running) when is_boolean(running),
+    do: GenServer.call(server, {:set_running, running}, :infinity)
+
   def login(server, mode), do: GenServer.call(server, {:login, mode}, :infinity)
   def logout(server), do: GenServer.call(server, :logout, :infinity)
 
@@ -48,6 +52,23 @@ defmodule Tailscale.Controller do
 
   def handle_call(:reset, _from, state) do
     {result, state} = configure_now(state, Keyword.get(state.opts, :config, %{}))
+    {:reply, result, state}
+  end
+
+  def handle_call({:set_running, running}, _from, state) do
+    result =
+      with :ok <- ready(state),
+           {:ok, _, _} <-
+             LocalAPI.request(state.opts, "PATCH", "prefs", %{
+               "WantRunning" => running,
+               "WantRunningSet" => true
+             }),
+           {:ok, prefs} <- read_preferences(state.opts) do
+        if prefs["WantRunning"] == running,
+          do: :ok,
+          else: {:error, :preferences_readback_mismatch}
+      end
+
     {:reply, result, state}
   end
 

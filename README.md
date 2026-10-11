@@ -63,6 +63,11 @@ library defaults. Startup only reads settings. The daemon owns persistence;
 settings made before enrollment may be lost on restart. Commands return errors
 without retrying writes, and multi-setting changes can partially apply.
 
+Use `Tailscale.down()` and `Tailscale.up()` to set the daemon's `WantRunning`
+preference without logging out or resetting configuration. `:ok` confirms readback,
+not connectivity or termination of every existing proxy session. The daemon stays
+running; startup behavior is unchanged. `up/0` does not initiate login.
+
 ## 3. Serve your app over HTTPS
 
 Enable MagicDNS and HTTPS in your tailnet. After login, check

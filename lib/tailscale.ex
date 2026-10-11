@@ -212,6 +212,27 @@ defmodule Tailscale do
   def unsubscribe(path), do: PropertyTable.unsubscribe(Tailscale.Properties, path)
 
   @doc """
+  Request that Tailscale run by setting only `WantRunning=true`.
+  Does not initiate login or reset configuration; use `login/1` if authentication
+  is needed. `:ok` confirms preference readback, not that the device is online.
+  Observe `["state"]` through `get/1` or subscriptions for connectivity.
+  The command is serialized with other library writes and is never automatically retried.
+  """
+  @spec up() :: result()
+  def up, do: Controller.set_running(Controller, true)
+
+  @doc """
+  Request that Tailscale stop by setting only `WantRunning=false`.
+  Does not log out, delete identity, reset configuration, or terminate the daemon;
+  LocalAPI remains available. `:ok` confirms preference readback, not that every
+  existing proxy session or in-flight packet has terminated. This is not a verified
+  forwarding barrier and does not change startup behavior.
+  The command is serialized with other library writes and is never automatically retried.
+  """
+  @spec down() :: result()
+  def down, do: Controller.set_running(Controller, false)
+
+  @doc """
   Return `{:ok, url}` for browser enrollment, or `:ok` if already running.
   Waits up to 30 seconds for the URL after initiating login, never for browser
   completion. Override this URL wait with `timeout: milliseconds`. A timeout

@@ -56,6 +56,19 @@ defmodule TailscaleTest do
     end
   end
 
+  test "up and down change the running preference without claiming connectivity", ctx do
+    assert :ok = Tailscale.up()
+    assert UnixHTTP.state(ctx.daemon).prefs["WantRunning"] == true
+    assert Tailscale.get(["state"]) == :offline
+    assert Tailscale.get(["auth", "state"]) == :needs_login
+    assert :ok = Tailscale.down()
+    assert UnixHTTP.state(ctx.daemon).prefs["WantRunning"] == false
+
+    UnixHTTP.update(ctx.daemon, &put_in(&1.failures[{"PATCH", "/localapi/v0/prefs"}], 403))
+    assert {:error, {:http, 403}} = Tailscale.up()
+    assert {:error, {:http, 403}} = Tailscale.down()
+  end
+
   test "public validation and replacement/defaults" do
     assert {:error, _} = Tailscale.configure(%{auth_key: "private"})
     assert {:error, :invalid_options} = Tailscale.login(force: true)
