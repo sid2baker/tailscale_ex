@@ -6,6 +6,8 @@ for breaking changes, and versions follow [Semantic Versioning](https://semver.o
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-15
+
 ### Breaking changes
 
 - Use `/data/tailscaled_ex` on Nerves and `~/.local/share/tailscaled_ex` elsewhere
