@@ -1,6 +1,6 @@
-defmodule Tailscale.InstallTest do
+defmodule Tailscaled.InstallTest do
   use ExUnit.Case, async: true
-  alias Mix.Tasks.Tailscale.Install
+  alias Mix.Tasks.Tailscaled.Install
 
   @moduletag :tmp_dir
 
@@ -42,7 +42,7 @@ defmodule Tailscale.InstallTest do
     assert_raise OptionParser.ParseError, fn -> Install.run(["--unknown"]) end
 
     for args <- [[], [""], ["first", "second"], ["--arch", "arm64"]] do
-      assert_raise Mix.Error, ~r/Usage: mix tailscale.install DESTINATION/, fn ->
+      assert_raise Mix.Error, ~r/Usage: mix tailscaled\.install DESTINATION/, fn ->
         Install.run(args)
       end
     end

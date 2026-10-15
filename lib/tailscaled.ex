@@ -1,6 +1,6 @@
-defmodule Tailscale do
+defmodule Tailscaled do
   @moduledoc """
-  Supervised Tailscale networking for Elixir and Nerves.
+  Supervised integration with the `tailscaled` daemon for Elixir and Nerves.
 
   The daemon owns configuration, identity, authentication, and persistence.
   This library manages its lifecycle, issues commands, and caches observations.
@@ -10,7 +10,7 @@ defmodule Tailscale do
 
   ## Application options
 
-  Set these with `config :tailscale, option: value`. They are read at application
+  Set these with `config :tailscaled_ex, option: value`. They are read at application
   startup; change running daemon settings with `update_configuration/1` instead.
 
   | Option | Default | Purpose |
@@ -30,12 +30,13 @@ defmodule Tailscale do
   | `:max_body`, `:max_frame` | `4_194_304` each | Byte limits for HTTP response bodies and watch frames. |
 
   `data_dir` defaults to `/data/tailscale_ex` when Nerves.Runtime is available,
-  otherwise `~/.local/share/tailscale_ex`. Use durable writable storage for identity.
-  The managed socket defaults to `<data_dir>/run/tailscaled.sock`.
+  otherwise `~/.local/share/tailscale_ex`. These legacy directory names are retained
+  across the package rename to preserve existing identities. Use durable writable
+  storage for identity. The managed socket defaults to `<data_dir>/run/tailscaled.sock`.
 
   To attach to an existing daemon:
 
-      config :tailscale,
+      config :tailscaled_ex,
         manage_daemon: false,
         socket: "/var/run/tailscale/tailscaled.sock"
 
@@ -106,7 +107,7 @@ defmodule Tailscale do
   * `["auth", "state"]`: `:unknown | :needs_login | :authenticating |
     :needs_approval | :authenticated | :stopped | :error`.
   * `["auth", "url"]`: secret HTTPS enrollment URL, removed on completion, error,
-    disconnect, or cache expiry. `:auth_url_ttl` does not extend the server's URL validity.
+    disconnect, profile reset, or cache expiry. `:auth_url_ttl` does not extend the server's URL validity.
   * `["auth", "error"]`: sanitized failure category, absent on success.
   * `["peers", id, field]`: stable node ID (numeric fallback), with `"hostname"`,
     `"dns_name"`, `"ipv4"`, `"ipv6"`, and `"online"` fields. Missing values are absent.
@@ -127,7 +128,7 @@ defmodule Tailscale do
   See the README for installation and a quick start.
   """
 
-  alias Tailscale.Controller
+  alias Tailscaled.Controller
 
   @type path :: [String.t()]
   @type pattern :: [String.t() | :_]
@@ -175,13 +176,25 @@ defmodule Tailscale do
   Return cached daemon settings, or nil when preferences are unavailable.
   The `:serve` field is omitted when unreadable or unsupported; see
   `["configuration", "error"]` for the reason. Missing Serve is not an empty list.
+
+  This never performs daemon I/O. External Serve changes may not emit notifications;
+  call `refresh_configuration/0` first when a fresh observation is needed.
   """
   @spec get_configuration() :: configuration() | nil
   def get_configuration, do: get(["configuration", "value"])
 
   @doc """
+  Read preferences and Serve from the daemon and update the configuration cache.
+  Returns `:ok` or a read error; use `get_configuration/0` to read the result.
+  Waits for observer readiness and serializes with library commands, but never writes
+  daemon settings. Failed reads use the existing observation retry mechanism.
+  """
+  @spec refresh_configuration() :: result()
+  def refresh_configuration, do: Controller.refresh_configuration(Controller)
+
+  @doc """
   Apply the `:config` map read at application startup, filling omitted fields with
-  library defaults. For example, `config :tailscale, config: %{accept_dns: true}`
+  library defaults. For example, `config :tailscaled_ex, config: %{accept_dns: true}`
   makes an explicit reset enable Tailscale DNS management and reset all other managed fields.
   With no `:config`, this is equivalent to `configure(%{})`. It does not log out
   or delete identity. The validation and partial-write semantics of `configure/1` apply.
@@ -191,25 +204,25 @@ defmodule Tailscale do
 
   @doc "Read a cached property, returning `default` if absent."
   @spec get(path(), term()) :: term()
-  def get(path, default \\ nil), do: PropertyTable.get(Tailscale.Properties, path, default)
+  def get(path, default \\ nil), do: PropertyTable.get(Tailscaled.Properties, path, default)
 
   @doc "Return cached `{path, value}` pairs matching a prefix (or `:_` wildcard)."
   @spec get_by_prefix(pattern()) :: [{path(), term()}]
-  def get_by_prefix(path), do: PropertyTable.match(Tailscale.Properties, path)
+  def get_by_prefix(path), do: PropertyTable.match(Tailscaled.Properties, path)
 
   @doc """
   Subscribe the calling process to a prefix/wildcard, before reading its initial value.
   No initial snapshot is sent. For example, `["auth"]` matches all auth properties,
   and `["peers", :_, "online"]` matches each peer's online status.
-  Messages are `{Tailscale, path, old, new, %{old_timestamp: old_ts, new_timestamp: ts}}`.
+  Messages are `{Tailscaled, path, old, new, %{old_timestamp: old_ts, new_timestamp: ts}}`.
   Timestamps use native monotonic time units; deleted values are `nil`.
   """
   @spec subscribe(pattern()) :: :ok
-  def subscribe(path), do: PropertyTable.subscribe(Tailscale.Properties, path)
+  def subscribe(path), do: PropertyTable.subscribe(Tailscaled.Properties, path)
 
   @doc "Stop the calling process's subscription for this exact pattern."
   @spec unsubscribe(pattern()) :: :ok
-  def unsubscribe(path), do: PropertyTable.unsubscribe(Tailscale.Properties, path)
+  def unsubscribe(path), do: PropertyTable.unsubscribe(Tailscaled.Properties, path)
 
   @doc """
   Request that Tailscale run by setting only `WantRunning=true`.
@@ -254,7 +267,7 @@ defmodule Tailscale do
 
   def login(timeout: timeout) when is_integer(timeout) and timeout in 1..4_294_967_295 do
     with :ok <- Controller.login(Controller, :interactive) do
-      Tailscale.Monitor.await_login(Tailscale.Monitor, timeout)
+      Tailscaled.Monitor.await_login(Tailscaled.Monitor, timeout)
     end
   end
 
@@ -276,5 +289,5 @@ defmodule Tailscale do
   expired login URLs. Raw properties and subscription messages are not redacted.
   """
   @spec info() :: :ok
-  def info, do: Tailscale.Info.print()
+  def info, do: Tailscaled.Info.print()
 end

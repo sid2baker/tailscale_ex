@@ -1,9 +1,9 @@
-defmodule Tailscale.Configuration do
+defmodule Tailscaled.Configuration do
   @moduledoc false
 
   import Bitwise
 
-  alias Tailscale.Serve
+  alias Tailscaled.Serve
 
   @defaults %{
     hostname: "",

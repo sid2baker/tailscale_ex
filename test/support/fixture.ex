@@ -1,12 +1,12 @@
-defmodule Tailscale.Test.Fixture do
+defmodule Tailscaled.Test.Fixture do
   @moduledoc false
-  alias Tailscale.Test.UnixHTTP
+  alias Tailscaled.Test.UnixHTTP
 
   # Exercise the application's actual tree with isolated OTP start arguments.
   def child_spec(opts) do
     %{
-      id: Tailscale.Supervisor,
-      start: {Tailscale.Application, :start, [:normal, opts]},
+      id: Tailscaled.Supervisor,
+      start: {Tailscaled.Application, :start, [:normal, opts]},
       type: :supervisor
     }
   end

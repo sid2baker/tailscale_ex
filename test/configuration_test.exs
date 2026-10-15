@@ -1,6 +1,6 @@
-defmodule Tailscale.ConfigurationTest do
+defmodule Tailscaled.ConfigurationTest do
   use ExUnit.Case, async: true
-  alias Tailscale.Configuration
+  alias Tailscaled.Configuration
 
   test "normalizes managed values and CIDR networks" do
     assert {:ok, config} =

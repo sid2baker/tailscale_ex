@@ -1,7 +1,7 @@
-defmodule Tailscale.LocalAPI do
+defmodule Tailscaled.LocalAPI do
   @moduledoc false
 
-  alias Tailscale.LocalAPI.Frames
+  alias Tailscaled.LocalAPI.Frames
 
   # InitialState | InitialPrefs | InitialHealthState | PeerChanges | NoNetMap | InitialStatus
   @watch_mask 28_806

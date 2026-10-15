@@ -1,8 +1,8 @@
-defmodule Tailscale.ControllerTest do
+defmodule Tailscaled.ControllerTest do
   use ExUnit.Case, async: true
-  import Tailscale.Test.Fixture, only: [eventually: 1]
-  alias Tailscale.{Controller, Monitor}
-  alias Tailscale.Test.{Fixture, UnixHTTP}
+  import Tailscaled.Test.Fixture, only: [eventually: 1]
+  alias Tailscaled.{Controller, Monitor}
+  alias Tailscaled.Test.{Fixture, UnixHTTP}
 
   setup do
     {:ok, daemon} = Fixture.daemon()
@@ -190,7 +190,7 @@ defmodule Tailscale.ControllerTest do
     dns(ctx)
     assert :ok = Controller.configure(ctx.controller, %{hostname: "cached"})
     endpoints = [%{https: 8443, to: "http://localhost:8080"}]
-    {:ok, serve} = Tailscale.Serve.build(%{}, endpoints, "device.ts.net")
+    {:ok, serve} = Tailscaled.Serve.build(%{}, endpoints, "device.ts.net")
 
     UnixHTTP.update(ctx.daemon, fn state ->
       %{

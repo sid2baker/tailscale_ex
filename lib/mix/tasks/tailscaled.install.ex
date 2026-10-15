@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.Tailscale.Install do
+defmodule Mix.Tasks.Tailscaled.Install do
   use Mix.Task
 
   @shortdoc "Download the tested tailscaled binary for the current target"
@@ -6,14 +6,14 @@ defmodule Mix.Tasks.Tailscale.Install do
   Downloads Tailscale 1.102.3 from the official stable repository and verifies its
   published SHA-256 checksum. Installs only `tailscaled`; no daemon is started.
 
-      mix tailscale.install ./bin/tailscaled
-      MIX_TARGET=rpi4 mix tailscale.install rootfs_overlay/usr/sbin/tailscaled
-      MIX_TARGET=custom mix tailscale.install ./bin/tailscaled --arch arm64
+      mix tailscaled.install ./bin/tailscaled
+      MIX_TARGET=rpi4 mix tailscaled.install rootfs_overlay/usr/sbin/tailscaled
+      MIX_TARGET=custom mix tailscaled.install ./bin/tailscaled --arch arm64
 
-  Run in the application that depends on `:tailscale`. The required destination is
+  Run in the application that depends on `:tailscaled_ex`. The required destination is
   the full binary filename, relative to the current directory or absolute. Parent
   directories are created; an existing binary is replaced only after verification.
-  Configure `:tailscale, :daemon_path` with its path on the running device (for the
+  Configure `:tailscaled_ex, :daemon_path` with its path on the running device (for the
   Nerves overlay example, `/usr/sbin/tailscaled`).
 
   For Nerves, use your firmware's `MIX_TARGET`. Architecture detection uses
@@ -38,7 +38,7 @@ defmodule Mix.Tasks.Tailscale.Install do
     destination =
       case rest do
         [path] when path != "" -> path
-        _ -> Mix.raise("Usage: mix tailscale.install DESTINATION [--arch ARCH]")
+        _ -> Mix.raise("Usage: mix tailscaled.install DESTINATION [--arch ARCH]")
       end
 
     arch =

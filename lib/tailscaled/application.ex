@@ -1,12 +1,12 @@
-defmodule Tailscale.Application do
+defmodule Tailscaled.Application do
   @moduledoc false
   use Application
 
-  alias Tailscale.{Controller, Daemon, Monitor}
+  alias Tailscaled.{Controller, Daemon, Monitor}
 
   @impl true
   def start(_type, args) do
-    opts = Application.get_all_env(:tailscale) |> Keyword.merge(args) |> options()
+    opts = Application.get_all_env(:tailscaled_ex) |> Keyword.merge(args) |> options()
 
     children = [
       {PropertyTable, name: Keyword.fetch!(opts, :table), event_transformer: &event/1},
@@ -17,7 +17,7 @@ defmodule Tailscale.Application do
 
     Supervisor.start_link(children,
       strategy: :rest_for_one,
-      name: Keyword.get(opts, :supervisor, Tailscale.Supervisor)
+      name: Keyword.get(opts, :supervisor, Tailscaled.Supervisor)
     )
   end
 
@@ -41,7 +41,7 @@ defmodule Tailscale.Application do
     Keyword.merge(
       [
         manage_daemon: true,
-        table: Tailscale.Properties,
+        table: Tailscaled.Properties,
         monitor: Monitor,
         controller: Controller,
         daemon: Daemon,
@@ -54,7 +54,7 @@ defmodule Tailscale.Application do
   end
 
   defp event(event) do
-    {Tailscale, event.property, event.previous_value, event.value,
+    {Tailscaled, event.property, event.previous_value, event.value,
      %{old_timestamp: event.previous_timestamp, new_timestamp: event.timestamp}}
   end
 end

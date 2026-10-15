@@ -1,7 +1,7 @@
-defmodule Tailscale.ServeTest do
+defmodule Tailscaled.ServeTest do
   use ExUnit.Case, async: true
-  alias Tailscale.Serve
-  alias Tailscale.Test.UnixHTTP
+  alias Tailscaled.Serve
+  alias Tailscaled.Test.UnixHTTP
 
   @endpoints [%{https: 443, to: "http://127.0.0.1:80"}]
 

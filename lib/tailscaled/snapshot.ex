@@ -1,4 +1,4 @@
-defmodule Tailscale.Snapshot do
+defmodule Tailscaled.Snapshot do
   @moduledoc false
 
   defstruct backend: :unknown,
@@ -92,7 +92,7 @@ defmodule Tailscale.Snapshot do
     # Profile resets emit NoState without an empty SelfChange or peer removals.
     snapshot =
       if notification["State"] in [0, "NoState"] do
-        %{snapshot | self: %{}, peers: %{}}
+        %{snapshot | self: %{}, peers: %{}, url: nil, error: nil, auth_attempt: false}
       else
         snapshot
       end

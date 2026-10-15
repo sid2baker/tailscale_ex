@@ -1,7 +1,7 @@
-defmodule Tailscale.Serve do
+defmodule Tailscaled.Serve do
   @moduledoc false
 
-  alias Tailscale.LocalAPI
+  alias Tailscaled.LocalAPI
 
   @owned ["TCP", "Web", "AllowFunnel"]
 
@@ -27,7 +27,7 @@ defmodule Tailscale.Serve do
 
   defp endpoint(%{https: port, to: to} = entry)
        when map_size(entry) == 2 and is_integer(port) and port in 1..65_535 and is_binary(to) do
-    case URI.new(to) do
+    case parse_target(to) do
       {:ok,
        %URI{scheme: scheme, host: host, userinfo: nil, fragment: nil, port: target_port} = uri}
       when scheme in ["http", "https"] and is_binary(host) and host != "" and
@@ -40,6 +40,10 @@ defmodule Tailscale.Serve do
   end
 
   defp endpoint(_), do: {:error, :invalid_serve}
+
+  defp parse_target(to) do
+    if String.valid?(to), do: URI.new(to), else: {:error, :invalid_serve_target}
+  end
 
   def decode(nil), do: {:ok, []}
 

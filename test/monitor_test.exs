@@ -1,9 +1,9 @@
-defmodule Tailscale.MonitorTest do
+defmodule Tailscaled.MonitorTest do
   use ExUnit.Case, async: true
-  import Tailscale.Test.Fixture, only: [eventually: 1]
+  import Tailscaled.Test.Fixture, only: [eventually: 1]
   import ExUnit.CaptureLog
-  alias Tailscale.{Monitor, Snapshot}
-  alias Tailscale.Test.{Fixture, UnixHTTP}
+  alias Tailscaled.{Monitor, Snapshot}
+  alias Tailscaled.Test.{Fixture, UnixHTTP}
 
   setup do
     {:ok, daemon} = Fixture.daemon()
@@ -28,20 +28,23 @@ defmodule Tailscale.MonitorTest do
     }
 
     UnixHTTP.notify(ctx.daemon, %{"PeersChanged" => [peer]})
-    assert_receive {Tailscale, ["peers", "n42", "online"], nil, true, %{new_timestamp: timestamp}}
+
+    assert_receive {Tailscaled, ["peers", "n42", "online"], nil, true,
+                    %{new_timestamp: timestamp}}
+
     assert is_integer(timestamp)
     assert PropertyTable.get(ctx.table, ["peers", "n42", "ipv4"]) == {100, 1, 2, 3}
     UnixHTTP.notify(ctx.daemon, %{"PeersChanged" => [peer]})
-    refute_receive {Tailscale, ["peers", "n42", "online"], _, _, _}, 50
+    refute_receive {Tailscaled, ["peers", "n42", "online"], _, _, _}, 50
 
     UnixHTTP.notify(ctx.daemon, %{
       "PeersChanged" => [%{"ID" => 42, "StableID" => "n42", "Online" => false}]
     })
 
-    assert_receive {Tailscale, ["peers", "n42", "online"], true, false, _}
+    assert_receive {Tailscaled, ["peers", "n42", "online"], true, false, _}
     eventually(fn -> assert PropertyTable.get(ctx.table, ["peers", "n42", "ipv4"]) == nil end)
     UnixHTTP.notify(ctx.daemon, %{"PeersRemoved" => [42]})
-    assert_receive {Tailscale, ["peers", "n42", "online"], false, nil, _}
+    assert_receive {Tailscaled, ["peers", "n42", "online"], false, nil, _}
   end
 
   test "disconnect marks unavailable, clears obsolete data and rebuilds an empty peer snapshot",
@@ -54,7 +57,7 @@ defmodule Tailscale.MonitorTest do
     eventually(fn -> assert PropertyTable.get(ctx.table, ["state"]) == :online end)
     PropertyTable.subscribe(ctx.table, ["state"])
     UnixHTTP.disconnect(ctx.daemon)
-    assert_receive {Tailscale, ["state"], _, :unavailable, _}
+    assert_receive {Tailscaled, ["state"], _, :unavailable, _}
     eventually(fn -> assert PropertyTable.get(ctx.table, ["monitor", "generation"]) >= 2 end)
     assert PropertyTable.match(ctx.table, ["peers"]) == []
     assert PropertyTable.get(ctx.table, ["state"]) == :offline
@@ -79,12 +82,12 @@ defmodule Tailscale.MonitorTest do
     eventually(fn -> assert PropertyTable.get(ctx.table, ["auth", "url"]) == url end)
     PropertyTable.subscribe(ctx.table, ["auth", "url"])
     UnixHTTP.disconnect(ctx.daemon)
-    assert_receive {Tailscale, ["auth", "url"], ^url, nil, _}
+    assert_receive {Tailscaled, ["auth", "url"], ^url, nil, _}
     eventually(fn -> assert PropertyTable.get(ctx.table, ["monitor", "generation"]) >= 2 end)
     assert PropertyTable.get(ctx.table, ["auth", "url"]) == nil
-    assert :ok = Tailscale.Controller.login(ctx.opts[:controller], :interactive)
+    assert :ok = Tailscaled.Controller.login(ctx.opts[:controller], :interactive)
     UnixHTTP.notify(ctx.daemon, %{"BrowseToURL" => url <> "-new"})
-    assert_receive {Tailscale, ["auth", "url"], nil, new_url, _}
+    assert_receive {Tailscaled, ["auth", "url"], nil, new_url, _}
     assert new_url == url <> "-new"
   end
 
@@ -176,6 +179,49 @@ defmodule Tailscale.MonitorTest do
       refute Map.has_key?(properties, ["dns_name"])
       refute Map.has_key?(properties, ["peers", "n10", "online"])
     end
+  end
+
+  test "profile resets clear authentication URLs, errors and attempts" do
+    for reset <- [0, "NoState"],
+        snapshot <- [
+          %Snapshot{url: "https://login.tailscale.com/a/old", auth_attempt: true},
+          %Snapshot{error: :authentication_failed}
+        ] do
+      snapshot =
+        snapshot |> Snapshot.update(%{"State" => reset}) |> Snapshot.update(%{"State" => 2})
+
+      assert snapshot.url == nil
+      assert snapshot.error == nil
+      refute snapshot.auth_attempt
+      assert Snapshot.properties(snapshot)[["auth", "state"]] == :needs_login
+    end
+  end
+
+  test "profile resets resolve pending login waiters", ctx do
+    assert :ok = Monitor.auth(ctx.monitor, :starting)
+    login = Task.async(fn -> Monitor.await_login(ctx.monitor, 5_000) end)
+    eventually(fn -> assert map_size(elem(:sys.get_state(ctx.monitor), 1).login_waiters) == 1 end)
+    UnixHTTP.notify(ctx.daemon, %{"State" => 0})
+    assert Task.await(login) == {:error, :logged_out}
+    assert elem(:sys.get_state(ctx.monitor), 1).login_waiters == %{}
+  end
+
+  test "profile resets remove the published URL and cancel its expiry", ctx do
+    :sys.replace_state(ctx.monitor, fn {phase, data} ->
+      {phase, %{data | opts: Keyword.put(data.opts, :auth_url_ttl, 200)}}
+    end)
+
+    url = "https://login.tailscale.com/a/old-profile"
+    assert :ok = Monitor.auth(ctx.monitor, :starting)
+    assert :ok = Monitor.auth(ctx.monitor, {:url, url})
+    PropertyTable.subscribe(ctx.table, ["auth", "url"])
+    UnixHTTP.notify(ctx.daemon, %{"State" => 0})
+    assert_receive {Tailscaled, ["auth", "url"], ^url, nil, _}
+    UnixHTTP.notify(ctx.daemon, %{"State" => 2})
+    eventually(fn -> assert PropertyTable.get(ctx.table, ["auth", "state"]) == :needs_login end)
+    Process.sleep(250)
+    assert PropertyTable.get(ctx.table, ["auth", "error"]) == nil
+    assert PropertyTable.get(ctx.table, ["auth", "state"]) == :needs_login
   end
 
   test "login waiters have independent deadlines and are cleared on completion", ctx do

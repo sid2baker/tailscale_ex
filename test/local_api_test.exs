@@ -1,8 +1,8 @@
-defmodule Tailscale.LocalAPITest do
+defmodule Tailscaled.LocalAPITest do
   use ExUnit.Case, async: true
-  alias Tailscale.LocalAPI
-  alias Tailscale.LocalAPI.Frames
-  alias Tailscale.Test.UnixHTTP
+  alias Tailscaled.LocalAPI
+  alias Tailscaled.LocalAPI.Frames
+  alias Tailscaled.Test.UnixHTTP
 
   test "NDJSON handles every split, multiple frames, blanks and CRLF" do
     data = "{\"State\":2}\r\n\n{\"BrowseToURL\":\"https://example.com/a\"}\n"

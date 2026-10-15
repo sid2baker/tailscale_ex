@@ -1,4 +1,4 @@
-defmodule Tailscale.Daemon do
+defmodule Tailscaled.Daemon do
   @moduledoc false
   use GenServer
 

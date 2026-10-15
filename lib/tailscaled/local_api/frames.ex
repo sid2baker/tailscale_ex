@@ -1,4 +1,4 @@
-defmodule Tailscale.LocalAPI.Frames do
+defmodule Tailscaled.LocalAPI.Frames do
   @moduledoc false
 
   # The limit applies to each frame, not to a socket chunk (which can contain many).

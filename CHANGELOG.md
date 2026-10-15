@@ -1,0 +1,48 @@
+# Changelog
+
+All notable changes to this project are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with an explicit section
+for breaking changes, and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased
+
+## 0.2.0 - 2026-10-15
+
+### Breaking changes
+
+- Rename the package and OTP application from `:tailscale` to `:tailscaled_ex`,
+  and the module namespace and subscription message tag from `Tailscale` to
+  `Tailscaled`. Update application configuration, calls, and message patterns.
+- Rename the installer task from `mix tailscale.install` to `mix tailscaled.install`.
+  Existing identity storage paths remain unchanged; no re-enrollment is needed.
+- Default `accept_dns` to `false` for complete configuration replacement and reset.
+  Startup, login, and partial updates do not override saved DNS preferences.
+
+### Added
+
+- Supervised daemon management and external-daemon attachment through LocalAPI.
+- Browser and auth-key login, logout, HTTPS Serve, cached state, and subscriptions.
+- Partial configuration updates that preserve omitted settings.
+- `refresh_configuration/0` to explicitly refresh cached settings after external changes,
+  including Serve edits that do not emit daemon notifications.
+- `up/0` and `down/0` commands with running-preference readback, without logging out
+  or resetting configuration. These do not guarantee termination of existing forwarding.
+- Target-aware installation of the tested daemon with SHA-256 verification.
+
+### Fixed
+
+- Reject a hostname change combined with nonempty Serve configuration before writing,
+  rather than binding Serve to the previous DNS name.
+- Clear cached identity, peers, and authentication state when the daemon resets its profile.
+- Return a validation error for invalid UTF-8 Serve targets instead of crashing the controller.
+
+### Security
+
+- Redact enrollment URLs and raw notifications from formatted monitor status and crash
+  reports, and redact HTTP(S) URLs in health warnings printed by `info/0`.
+- Keep auth keys out of controller diagnostic output, including OTP debug logs.
+
+### Compatibility
+
+- Requires Linux, Elixir 1.19 or later, and OTP 28 or later.
+- Tested with Tailscale 1.102.3; later 1.x versions require compatibility testing.

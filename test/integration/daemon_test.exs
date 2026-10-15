@@ -1,8 +1,8 @@
-defmodule Tailscale.DaemonIntegrationTest do
+defmodule Tailscaled.DaemonIntegrationTest do
   use ExUnit.Case, async: false
-  import Tailscale.Test.Fixture, only: [eventually: 1, eventually: 2]
-  alias Tailscale.{Controller, LocalAPI, Monitor}
-  alias Tailscale.Test.Fixture
+  import Tailscaled.Test.Fixture, only: [eventually: 1, eventually: 2]
+  alias Tailscaled.{Controller, LocalAPI, Monitor}
+  alias Tailscaled.Test.Fixture
 
   @moduletag :integration
   @moduletag timeout: 90_000
@@ -63,9 +63,9 @@ defmodule Tailscale.DaemonIntegrationTest do
     assert List.keyfind(headers, "etag", 0)
 
     assert {:error, :awaiting_dns_name} =
-             Tailscale.Serve.reconcile(ctx.opts, [%{https: 443, to: "http://127.0.0.1:80"}], nil)
+             Tailscaled.Serve.reconcile(ctx.opts, [%{https: 443, to: "http://127.0.0.1:80"}], nil)
 
-    assert {:ok, []} = Tailscale.Serve.reconcile(ctx.opts, [], nil)
+    assert {:ok, []} = Tailscaled.Serve.reconcile(ctx.opts, [], nil)
 
     identity = Path.join(ctx.directory, "identity")
     File.write!(Path.join(identity, "preserve-marker"), "identity storage must survive")
@@ -73,7 +73,7 @@ defmodule Tailscale.DaemonIntegrationTest do
     generation = PropertyTable.get(ctx.table, ["monitor", "generation"])
     :ok = PropertyTable.subscribe(ctx.table, ["state"])
     GenServer.stop(daemon_pid, :shutdown)
-    assert_receive {Tailscale, ["state"], _, :unavailable, _}, 10_000
+    assert_receive {Tailscaled, ["state"], _, :unavailable, _}, 10_000
 
     eventually(
       fn -> assert PropertyTable.get(ctx.table, ["monitor", "generation"]) > generation end,
@@ -94,7 +94,7 @@ defmodule Tailscale.DaemonIntegrationTest do
     assert configuration(ctx).hostname == ""
     assert configuration(ctx).accept_dns
     PropertyTable.unsubscribe(ctx.table, ["state"])
-    stop_supervised(Tailscale.Supervisor)
+    stop_supervised(Tailscaled.Supervisor)
     start_supervised!({Fixture, ctx.opts})
     assert PropertyTable.get(ctx.table, ["state"]) != :online
     assert :ok = Monitor.ready(ctx.opts[:monitor], 10_000)

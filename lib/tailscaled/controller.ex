@@ -1,8 +1,8 @@
-defmodule Tailscale.Controller do
+defmodule Tailscaled.Controller do
   @moduledoc false
   use GenServer
 
-  alias Tailscale.{Configuration, LocalAPI, Monitor, Serve}
+  alias Tailscaled.{Configuration, LocalAPI, Monitor, Serve}
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :controller))
@@ -12,10 +12,17 @@ defmodule Tailscale.Controller do
   def update_configuration(server, changes),
     do: GenServer.call(server, {:update_configuration, changes}, :infinity)
 
+  def refresh_configuration(server), do: GenServer.call(server, :refresh_configuration, :infinity)
+
   def reset(server), do: GenServer.call(server, :reset, :infinity)
 
   def set_running(server, running) when is_boolean(running),
     do: GenServer.call(server, {:set_running, running}, :infinity)
+
+  # format_status cannot scrub OTP's raw debug history. A closure hides the key
+  # from diagnostic output, not from trusted code inspecting its environment.
+  def login(server, {:auth_key, key}),
+    do: GenServer.call(server, {:login, {:auth_key, fn -> key end}}, :infinity)
 
   def login(server, mode), do: GenServer.call(server, {:login, mode}, :infinity)
   def logout(server), do: GenServer.call(server, :logout, :infinity)
@@ -48,6 +55,17 @@ defmodule Tailscale.Controller do
   def handle_call({:update_configuration, changes}, _from, state) do
     {result, state} = update_now(state, changes)
     {:reply, result, state}
+  end
+
+  def handle_call(:refresh_configuration, _from, state) do
+    case ready(state) do
+      :ok ->
+        {result, state} = refresh(state)
+        {:reply, result, state}
+
+      error ->
+        {:reply, error, state}
+    end
   end
 
   def handle_call(:reset, _from, state) do
@@ -108,7 +126,9 @@ defmodule Tailscale.Controller do
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
-  def format_status(status), do: Map.put(status, :message, :redacted)
+  def format_status(status) do
+    status |> Map.replace(:message, :redacted) |> Map.replace(:log, [])
+  end
 
   defp update_now(state, changes) do
     case Configuration.normalize(changes) do
@@ -272,7 +292,7 @@ defmodule Tailscale.Controller do
     with :ok <- Monitor.auth(state.monitor, :starting),
          {:ok, status, _} <- LocalAPI.request(state.opts, "GET", "status?peers=false"),
          :ok <- prepare_login(state),
-         {:ok, _, _} <- LocalAPI.request(state.opts, "POST", "start", %{"AuthKey" => key}) do
+         {:ok, _, _} <- LocalAPI.request(state.opts, "POST", "start", %{"AuthKey" => key.()}) do
       activate_key_login(state.opts, status)
     end
   rescue

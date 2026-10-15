@@ -1,9 +1,9 @@
-defmodule Tailscale.Info do
+defmodule Tailscaled.Info do
   @moduledoc false
 
   def print do
-    if Process.whereis(Tailscale.Properties) do
-      Tailscale.get_by_prefix([]) |> Map.new() |> format() |> IO.puts()
+    if Process.whereis(Tailscaled.Properties) do
+      Tailscaled.get_by_prefix([]) |> Map.new() |> format() |> IO.puts()
     else
       IO.puts("Tailscale is not started.")
     end

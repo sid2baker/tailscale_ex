@@ -1,8 +1,8 @@
-defmodule Tailscale.RecoveryTest do
+defmodule Tailscaled.RecoveryTest do
   use ExUnit.Case, async: true
-  import Tailscale.Test.Fixture, only: [eventually: 1]
-  alias Tailscale.{Controller, Monitor}
-  alias Tailscale.Test.{Fixture, UnixHTTP}
+  import Tailscaled.Test.Fixture, only: [eventually: 1]
+  alias Tailscaled.{Controller, Monitor}
+  alias Tailscaled.Test.{Fixture, UnixHTTP}
 
   test "library starts before socket exists; failed login cannot claim offline or online" do
     socket =
@@ -18,6 +18,7 @@ defmodule Tailscale.RecoveryTest do
     assert {:error, _} = Controller.configure(opts[:controller], %{hostname: "not-queued"})
     assert {:error, _} = Controller.set_running(opts[:controller], true)
     assert {:error, _} = Controller.set_running(opts[:controller], false)
+    assert {:error, :unavailable} = Controller.refresh_configuration(opts[:controller])
     assert PropertyTable.get(opts[:table], ["configuration", "value"]) == nil
     {:ok, daemon} = Fixture.daemon(socket: socket)
     assert :ok = Monitor.ready(opts[:monitor])
@@ -39,7 +40,8 @@ defmodule Tailscale.RecoveryTest do
       {Up, fn server -> Controller.set_running(server, true) end},
       {Down, fn server -> Controller.set_running(server, false) end},
       {Login, fn server -> Controller.login(server, :interactive) end},
-      {Logout, &Controller.logout/1}
+      {Logout, &Controller.logout/1},
+      {Refresh, &Controller.refresh_configuration/1}
     ]
 
     for {name, command} <- commands do
@@ -143,7 +145,7 @@ defmodule Tailscale.RecoveryTest do
     start_supervised!({Fixture, opts})
     assert :ok = Monitor.ready(opts[:monitor])
     assert :ok = Controller.configure(opts[:controller], %{hostname: "daemon-owned"})
-    stop_supervised(Tailscale.Supervisor)
+    stop_supervised(Tailscaled.Supervisor)
     start_supervised!({Fixture, Keyword.put(opts, :config, %{hostname: "app-default"})})
     assert :ok = Monitor.ready(opts[:monitor])
 
@@ -163,7 +165,7 @@ defmodule Tailscale.RecoveryTest do
     start_supervised!({Fixture, opts})
     on_exit(fn -> File.rm_rf(opts[:data_dir]) end)
     assert :ok = Monitor.ready(opts[:monitor])
-    assert :ok = Tailscale.Controller.configure(opts[:controller], %{hostname: "volatile"})
+    assert :ok = Tailscaled.Controller.configure(opts[:controller], %{hostname: "volatile"})
     old_controller = Process.whereis(opts[:controller])
     Process.exit(old_controller, :kill)
     eventually(fn -> assert Process.whereis(opts[:controller]) not in [nil, old_controller] end)
@@ -177,7 +179,7 @@ defmodule Tailscale.RecoveryTest do
     eventually(fn -> assert PropertyTable.get(opts[:table], ["state"]) == :online end)
     PropertyTable.subscribe(opts[:table], ["state"])
     Process.exit(Process.whereis(opts[:monitor]), :kill)
-    assert_receive {Tailscale, ["state"], :online, :unavailable, _}
+    assert_receive {Tailscaled, ["state"], :online, :unavailable, _}
     eventually(fn -> assert PropertyTable.get(opts[:table], ["state"]) == :offline end)
   end
 end

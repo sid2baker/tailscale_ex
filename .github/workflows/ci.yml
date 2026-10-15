@@ -41,6 +41,13 @@ jobs:
       - name: Run CI checks
         run: mix ci
 
+      - name: Build documentation and Hex package
+        env:
+          MIX_ENV: dev
+        run: |
+          mix docs --warnings-as-errors
+          mix hex.build
+
   daemon:
     name: Isolated Tailscale 1.102.3 userspace integration
     runs-on: ubuntu-latest

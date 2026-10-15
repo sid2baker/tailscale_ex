@@ -1,8 +1,8 @@
-defmodule Tailscale.Monitor do
+defmodule Tailscaled.Monitor do
   @moduledoc false
   @behaviour :gen_statem
 
-  alias Tailscale.{LocalAPI, Snapshot}
+  alias Tailscaled.{LocalAPI, Snapshot}
 
   def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
 

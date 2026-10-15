@@ -1,4 +1,4 @@
-defmodule Tailscale.Test.UnixHTTP do
+defmodule Tailscaled.Test.UnixHTTP do
   @moduledoc false
   use GenServer
 

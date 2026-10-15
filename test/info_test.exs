@@ -1,11 +1,11 @@
-defmodule Tailscale.InfoTest do
+defmodule Tailscaled.InfoTest do
   use ExUnit.Case, async: false
   import ExUnit.CaptureIO
-  alias Tailscale.Info
+  alias Tailscaled.Info
 
   test "prints a friendly message before the application starts" do
-    assert Process.whereis(Tailscale.Properties) == nil
-    assert capture_io(fn -> assert :ok = Tailscale.info() end) == "Tailscale is not started.\n"
+    assert Process.whereis(Tailscaled.Properties) == nil
+    assert capture_io(fn -> assert :ok = Tailscaled.info() end) == "Tailscale is not started.\n"
   end
 
   test "formats grouped status, readable addresses, configuration and errors" do
