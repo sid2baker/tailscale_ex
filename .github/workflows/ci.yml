@@ -78,5 +78,5 @@ jobs:
 
       - name: Run real-daemon tests (never attach to a host daemon)
         env:
-          TAILSCALE_TEST_NETWORK: ${{ inputs.network_tests && '1' || '0' }}
+          TAILSCALED_TEST_NETWORK: ${{ inputs.network_tests && '1' || '0' }}
         run: mix test test/integration/daemon_test.exs

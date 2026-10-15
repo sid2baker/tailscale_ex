@@ -17,11 +17,11 @@ workstation daemon. Keep new integration tests isolated, with temporary state an
 sockets; do not change host networking.
 
 To include real-daemon tests, set `TAILSCALED_TEST_BINARY` to an absolute path.
-`TAILSCALE_TEST_NETWORK=1` additionally enables tests that contact Tailscale's
+`TAILSCALED_TEST_NETWORK=1` additionally enables tests that contact Tailscale's
 control plane. These tests do not establish enrolled-tailnet or hardware support.
 
 Include regression tests for behavior changes. Describe user-visible changes in
-`CHANGELOG.md` under `Unreleased`, including migration steps for breaking changes.
+`CHANGELOG.md` under `Unreleased`.
 Do not use commit logs, test counts, or internal refactors as release notes.
 
 When reporting problems, include library/daemon versions and the platform.
@@ -33,7 +33,7 @@ Publication is manual. Building the package or pushing a commit does not publish
 
 1. Choose the version, update `mix.exs`, and move `Unreleased` entries into a
    `## X.Y.Z - YYYY-MM-DD` section. Keep an empty `Unreleased` section above it.
-2. Update the README's installation instructions when the first Hex version is ready.
+2. Update the README's dependency version.
 3. Run the checks above, including isolated real-daemon tests. Inspect the package
    contents: include source and documentation, never downloaded binaries or state.
 4. Test the built package in a fresh consumer project without starting its application.

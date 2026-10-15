@@ -25,9 +25,9 @@ defmodule Tailscaled.Application do
     data_dir =
       Keyword.get_lazy(opts, :data_dir, fn ->
         if Code.ensure_loaded?(Nerves.Runtime) do
-          "/data/tailscale_ex"
+          "/data/tailscaled_ex"
         else
-          Path.join(System.user_home!(), ".local/share/tailscale_ex")
+          Path.join(System.user_home!(), ".local/share/tailscaled_ex")
         end
       end)
 

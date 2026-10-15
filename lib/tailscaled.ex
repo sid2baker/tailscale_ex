@@ -29,10 +29,9 @@ defmodule Tailscaled do
   | `:auth_url_ttl` | `600_000` | Maximum cached login URL lifetime in milliseconds. |
   | `:max_body`, `:max_frame` | `4_194_304` each | Byte limits for HTTP response bodies and watch frames. |
 
-  `data_dir` defaults to `/data/tailscale_ex` when Nerves.Runtime is available,
-  otherwise `~/.local/share/tailscale_ex`. These legacy directory names are retained
-  across the package rename to preserve existing identities. Use durable writable
-  storage for identity. The managed socket defaults to `<data_dir>/run/tailscaled.sock`.
+  `data_dir` defaults to `/data/tailscaled_ex` when Nerves.Runtime is available,
+  otherwise `~/.local/share/tailscaled_ex`. Use durable writable storage for identity.
+  The managed socket defaults to `<data_dir>/run/tailscaled.sock`.
 
   To attach to an existing daemon:
 

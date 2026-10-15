@@ -6,15 +6,15 @@ for breaking changes, and versions follow [Semantic Versioning](https://semver.o
 
 ## Unreleased
 
+### Breaking changes
+
+- Use `/data/tailscaled_ex` on Nerves and `~/.local/share/tailscaled_ex` elsewhere
+  for default identity storage.
+
 ## 0.2.0 - 2026-10-15
 
 ### Breaking changes
 
-- Rename the package and OTP application from `:tailscale` to `:tailscaled_ex`,
-  and the module namespace and subscription message tag from `Tailscale` to
-  `Tailscaled`. Update application configuration, calls, and message patterns.
-- Rename the installer task from `mix tailscale.install` to `mix tailscaled.install`.
-  Existing identity storage paths remain unchanged; no re-enrollment is needed.
 - Default `accept_dns` to `false` for complete configuration replacement and reset.
   Startup, login, and partial updates do not override saved DNS preferences.
 

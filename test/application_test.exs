@@ -2,11 +2,11 @@ defmodule Tailscaled.ApplicationTest do
   use ExUnit.Case, async: false
   alias Tailscaled.Test.{Fixture, UnixHTTP}
 
-  test "the renamed application retains legacy default identity storage paths" do
+  test "default identity storage uses the package name" do
     {:ok, daemon} = Fixture.daemon()
     start_supervised!({Fixture, manage_daemon: false, socket: UnixHTTP.socket(daemon)})
     opts = :sys.get_state(Tailscaled.Daemon).opts
-    data_dir = Path.join(System.user_home!(), ".local/share/tailscale_ex")
+    data_dir = Path.join(System.user_home!(), ".local/share/tailscaled_ex")
     assert opts[:data_dir] == data_dir
     assert opts[:state_dir] == Path.join(data_dir, "identity")
   end
@@ -34,7 +34,11 @@ defmodule Tailscaled.ApplicationTest do
     assert :ok = Application.start(:tailscaled_ex)
     root = Process.whereis(Tailscaled.Supervisor)
     assert is_pid(root)
-    assert Process.whereis(Tailscaled.ApplicationSupervisor) == nil
+
+    daemon_opts = :sys.get_state(Tailscaled.Daemon).opts
+    assert daemon_opts[:data_dir] == directory
+    assert daemon_opts[:state_dir] == Path.join(directory, "identity")
+    assert daemon_opts[:socket] == UnixHTTP.socket(daemon)
 
     modules =
       root

@@ -1,8 +1,7 @@
 # Tailscaled for Elixir and Nerves
 
 Supervise the `tailscaled` daemon and use its LocalAPI for configuration, login,
-HTTPS Serve, and state subscriptions. This is an independent daemon integration,
-not the [`tailscale`](https://hex.pm/packages/tailscale) package based on tailscale-rs.
+HTTPS Serve, and state subscriptions.
 Requires Linux, Elixir 1.19+, and OTP 28+. Tested with Tailscale **1.102.3**.
 
 ## 1. Install
@@ -36,9 +35,9 @@ The application starts automatically—do not add it to your supervision tree.
 Userspace mode supports Serve without root or TUN. For a host-wide network interface,
 use `tun: :kernel` with TUN support and OS permissions.
 
-Keep `data_dir` on durable writable storage. Defaults: `/data/tailscale_ex` on Nerves,
-`~/.local/share/tailscale_ex` elsewhere. These legacy directory names are intentionally
-unchanged. For an existing daemon or other options, see the
+Store identity on durable writable storage. `data_dir` defaults to
+`/data/tailscaled_ex` on Nerves and `~/.local/share/tailscaled_ex` elsewhere.
+For an existing daemon or other options, see the
 [API reference](https://github.com/sid2baker/tailscaled_ex/blob/main/lib/tailscaled.ex).
 
 ## 2. Configure and log in
@@ -107,19 +106,6 @@ There is no background polling.
 See the [API reference](https://github.com/sid2baker/tailscaled_ex/blob/main/lib/tailscaled.ex)
 for settings, properties, login options, and logout.
 
-## Migrating from tailscale_ex
-
-- Rename the dependency and OTP configuration key from `:tailscale` to `:tailscaled_ex`.
-- Replace the `Tailscale` module namespace with `Tailscaled`, including subscription
-  message patterns and any references to registered processes.
-- Use `mix tailscaled.install` instead of `mix tailscale.install`.
-- Remove the old dependency from `mix.exs`, then run `mix deps.unlock tailscale`
-  and `mix deps.get` to update the lockfile.
-- Keep existing `data_dir`, `state_dir`, and `socket` overrides unchanged. Default
-  storage paths are also unchanged; do not delete identity files or re-enroll.
-
-The old namespace is not retained as an alias. See [CHANGELOG.md](CHANGELOG.md).
-
 ## Development
 
 Run `mix deps.get && mix ci`. To include isolated real-daemon tests:
@@ -128,7 +114,7 @@ Run `mix deps.get && mix ci`. To include isolated real-daemon tests:
 TAILSCALED_TEST_BINARY=/absolute/path/to/tailscaled mix ci
 ```
 
-Add `TAILSCALE_TEST_NETWORK=1` to enable control-plane URL and invalid-key tests.
+Add `TAILSCALED_TEST_NETWORK=1` to enable control-plane URL and invalid-key tests.
 Tests never attach to a host daemon; they do not cover enrolled-tailnet HTTPS or hardware.
 Run `mix docs --warnings-as-errors` to build the API documentation. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for development and release checks.

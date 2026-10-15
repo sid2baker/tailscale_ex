@@ -8,7 +8,7 @@ end
 exclude = if System.get_env("TAILSCALED_TEST_BINARY"), do: [], else: [integration: true]
 
 exclude =
-  if System.get_env("TAILSCALE_TEST_NETWORK") == "1",
+  if System.get_env("TAILSCALED_TEST_NETWORK") == "1",
     do: exclude,
     else: [network: true] ++ exclude
 
